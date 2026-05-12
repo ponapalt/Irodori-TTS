@@ -37,8 +37,7 @@ DICT_FILE = str(REPO_DIR / "dictionary.txt")
 for _d in [OUTPUT_DIR, REF_DIR]:
     Path(_d).mkdir(parents=True, exist_ok=True)
 
-FIXED_SECONDS = 30.0
-BASE_REPO = "Aratako/Irodori-TTS-500M-v2"
+BASE_REPO = "Aratako/Irodori-TTS-500M-v3"
 VD_REPO = "Aratako/Irodori-TTS-500M-v2-VoiceDesign"
 CODEC_REPO = "Aratako/Semantic-DACVAE-Japanese-32dim"
 _current_repo = None
@@ -103,7 +102,7 @@ def _make_key(ckpt):
     return RuntimeKey(
         checkpoint=ckpt, model_device=d, codec_repo=CODEC_REPO,
         model_precision="fp32", codec_device=d, codec_precision="fp32",
-        enable_watermark=False, compile_model=False, compile_dynamic=False,
+        compile_model=False, compile_dynamic=False,
     )
 
 
@@ -221,7 +220,7 @@ def generate_base(text, ref_audio, num_steps, cfg_t, cfg_s, seed_raw, speed, dic
         text=processed, ref_wav=ref, ref_latent=None, no_ref=no_ref,
         ref_normalize_db=-16.0, ref_ensure_max=True,
         num_candidates=1, decode_mode="sequential",
-        seconds=FIXED_SECONDS, max_ref_seconds=30.0, max_text_len=None,
+        seconds=None, max_ref_seconds=30.0, max_text_len=None,
         num_steps=int(num_steps), seed=seed,
         cfg_guidance_mode="independent",
         cfg_scale_text=float(cfg_t), cfg_scale_speaker=float(cfg_s),
@@ -260,7 +259,7 @@ def generate_vd(text, caption, num_steps, cfg_t, cfg_c, seed_raw, speed, dict_te
         ref_wav=None, ref_latent=None, no_ref=True,
         ref_normalize_db=-16.0, ref_ensure_max=True,
         num_candidates=1, decode_mode="sequential",
-        seconds=FIXED_SECONDS, max_ref_seconds=30.0,
+        seconds=None, max_ref_seconds=30.0,
         max_text_len=None, max_caption_len=None,
         num_steps=int(num_steps), seed=seed,
         cfg_guidance_mode="independent",
