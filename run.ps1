@@ -168,34 +168,46 @@ if ($reqHash -eq $storedHash) {
 Write-Host ""
 
 # ============================================================
-# 初回セットアップ時のみ: モデルの事前ダウンロード
+# モデルの事前ダウンロード（未取得分のみ）
 # ============================================================
-if ($venvCreated) {
-    Write-Host "============================================================"
-    Write-Host "  モデルの事前ダウンロード（任意）"
-    Write-Host "  スキップすると初回起動時に自動でダウンロードされます"
-    Write-Host "============================================================"
-    $dlChoice = Read-Host "今すぐダウンロードしますか？ [Y/N]"
-    Write-Host ""
+Write-Host "============================================================"
+Write-Host "  モデルキャッシュを確認中"
+Write-Host "============================================================"
 
-    if ($dlChoice -imatch '^y') {
-        Write-Host "  モデルをダウンロード中... 数分かかります"
-        $pyScript = Join-Path $env:TEMP 'irodori_dl.py'
-        @'
-from huggingface_hub import hf_hub_download
-print("  [1/2] ベースモデル (Irodori-TTS-500M-v2)...")
-p = hf_hub_download(repo_id="Aratako/Irodori-TTS-500M-v2", filename="model.safetensors")
-print(f"        完了: {p}")
-print("  [2/2] VoiceDesign (Irodori-TTS-500M-v2-VoiceDesign)...")
-p = hf_hub_download(repo_id="Aratako/Irodori-TTS-500M-v2-VoiceDesign", filename="model.safetensors")
-print(f"        完了: {p}")
-print("  ダウンロード完了！")
+$pyScript = Join-Path $env:TEMP 'irodori_dl.py'
+@'
+from huggingface_hub import hf_hub_download, try_to_load_from_cache
+from huggingface_hub.constants import HF_HUB_CACHE
+from huggingface_hub.errors import LocalEntryNotFoundError
+
+MODELS = [
+    ("ベースモデル",  "Aratako/Irodori-TTS-500M-v3",            "model.safetensors"),
+    ("VoiceDesign", "Aratako/Irodori-TTS-500M-v2-VoiceDesign", "model.safetensors"),
+]
+
+missing = []
+for label, repo_id, filename in MODELS:
+    cached = try_to_load_from_cache(repo_id=repo_id, filename=filename)
+    if isinstance(cached, str):
+        print(f"  [OK]   {label} ({repo_id}) は取得済み")
+    else:
+        print(f"  [MISS] {label} ({repo_id}) は未取得")
+        missing.append((label, repo_id, filename))
+
+if not missing:
+    print("  すべてのモデルが取得済みです。")
+else:
+    print("")
+    print(f"  未取得のモデルをダウンロードします ({len(missing)}件)... 数分かかります")
+    for i, (label, repo_id, filename) in enumerate(missing, 1):
+        print(f"  [{i}/{len(missing)}] {label} ({repo_id})...")
+        p = hf_hub_download(repo_id=repo_id, filename=filename)
+        print(f"          完了: {p}")
+    print("  ダウンロード完了！")
 '@ | Set-Content $pyScript -Encoding UTF8
-        & $PyVenvExe $pyScript
-        Remove-Item $pyScript -Force -ErrorAction SilentlyContinue
-        Write-Host ""
-    }
-}
+& $PyVenvExe $pyScript
+Remove-Item $pyScript -Force -ErrorAction SilentlyContinue
+Write-Host ""
 
 # ============================================================
 # アプリ起動
