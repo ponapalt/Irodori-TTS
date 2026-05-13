@@ -334,7 +334,7 @@ def build_ui():
     ffmpeg_status = "🎚️ 話速: 有効" if _FFMPEG_AVAILABLE else "🎚️ 話速: 無効(ffmpeg未検出)"
     speed_label_suffix = "" if _FFMPEG_AVAILABLE else " (ffmpeg未検出のため無効)"
 
-    with gr.Blocks(title="Irodori-TTS ゆうぷろカスタム V1.4.0 [ローカル版]", theme=gr.themes.Soft()) as app:
+    with gr.Blocks(title="Irodori-TTS ゆうぷろカスタム V1.4.0 [ローカル版]") as app:
         gr.Markdown("# 🎙️ Irodori-TTS ゆうぷろカスタム V1.4.0 [ローカル版]")
         gr.Markdown(
             f"🎤 ボイスクローン / 🎨 ボイスデザイン / 😄 絵文字 / "
@@ -464,7 +464,11 @@ def main():
     parser.add_argument("--server-port", type=int, default=7860, help="ポート番号 (デフォルト: 7860)")
     parser.add_argument("--share", action="store_true", help="Gradio 共有リンクを有効化")
     parser.add_argument("--debug", action="store_true", help="デバッグモードを有効化")
+    parser.add_argument("--watermark", action="store_true", help="silentcipher ウォーターマーク埋込を有効化（デフォルト: 無効）")
     args = parser.parse_args()
+
+    if not args.watermark:
+        os.environ["IRODORI_NO_WATERMARK"] = "1"
 
     print("=" * 60)
     print("🎙️ Irodori-TTS ゆうぷろカスタム V1.4.0 [ローカル版]")
@@ -493,6 +497,7 @@ def main():
         server_port=args.server_port,
         share=args.share,
         debug=args.debug,
+        theme=gr.themes.Soft(),
     )
 
 
