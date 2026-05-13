@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Iterable
 
 import torch
@@ -31,6 +32,10 @@ class SilentCipherWatermarker:
 
     @staticmethod
     def _load_backend(*, device: str, model_type: str):
+        if os.environ.get("IRODORI_NO_WATERMARK", "").strip().lower() in ("1", "true", "yes"):
+            logger.info("SilentCipher watermarking disabled via IRODORI_NO_WATERMARK.")
+            return None
+
         try:
             import silentcipher
         except ImportError:
