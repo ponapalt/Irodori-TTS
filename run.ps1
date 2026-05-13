@@ -1,13 +1,11 @@
 ﻿#Requires -Version 5.1
+# このファイルは UTF-8 BOM 付き (UTF-8 with BOM) で保存してください。
+# BOM なしで保存すると日本語文字の文字コードエラーが発生します。
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
-$RepoDir    = $PSScriptRoot
-$VenvDir    = Join-Path $RepoDir '.venv'
-$ActivatePs = Join-Path $VenvDir 'Scripts\Activate.ps1'
-$PipExe     = Join-Path $VenvDir 'Scripts\pip.exe'
-$PyVenvExe  = Join-Path $VenvDir 'Scripts\python.exe'
+$RepoDir = $PSScriptRoot
 
 Write-Host ""
 Write-Host "============================================================"
@@ -16,71 +14,45 @@ Write-Host "============================================================"
 Write-Host ""
 
 # ============================================================
-# Step 1: Python 確認
+# Step 1: uv 確認
 # ============================================================
-Write-Host "[Step 1/5] Python を確認中..."
+Write-Host "[Step 1/4] uv を確認中..."
 
-$PythonExe      = $null
-$PythonBaseArgs = @()
-
-try {
-    $output = & py '-3.10' '--version' 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        $PythonExe      = 'py'
-        $PythonBaseArgs = @('-3.10')
-        Write-Host "  $output"
-    }
-} catch {}
-
-if (-not $PythonExe) {
-    try {
-        $output = & python '--version' 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            $PythonExe      = 'python'
-            $PythonBaseArgs = @()
-            Write-Host "  $output"
-            Write-Host "  注意: Python 3.10 を推奨します（.python-version 参照）"
-        }
-    } catch {}
-}
-
-if (-not $PythonExe) {
-    Write-Host ""
-    Write-Host "[ERROR] Python が見つかりません。Python 3.10 をインストールしてください:"
-    Write-Host "        https://www.python.org/downloads/release/python-31011/"
-    Write-Host ""
-    Read-Host "続行するには Enter キーを押してください"
-    exit 1
-}
-Write-Host ""
-
-# ============================================================
-# Step 2: 仮想環境
-# ============================================================
-Write-Host "[Step 2/5] 仮想環境を確認中..."
-
-$venvCreated = $false
-if (-not (Test-Path $ActivatePs)) {
-    Write-Host "  仮想環境を作成中: $VenvDir"
-    & $PythonExe @PythonBaseArgs '-m' 'venv' $VenvDir
+if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+    Write-Host "  uv が見つかりません。自動インストールします..."
+    powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "[ERROR] 仮想環境の作成に失敗しました。"
+        Write-Host ""
+        Write-Host "[ERROR] uv のインストールに失敗しました。"
+        Write-Host "        手動でインストールしてください:"
+        Write-Host "        powershell -ExecutionPolicy ByPass -c `"irm https://astral.sh/uv/install.ps1 | iex`""
+        Write-Host ""
         Read-Host "続行するには Enter キーを押してください"
         exit 1
     }
-    $venvCreated = $true
-    Write-Host "  作成完了。"
-} else {
-    Write-Host "  既存の仮想環境を使用: $VenvDir"
+    # インストール直後は PATH に含まれていないため、既定の場所を直接追加する
+    $uvBin = Join-Path $env:USERPROFILE '.local\bin'
+    if (Test-Path $uvBin) {
+        $env:PATH = "$uvBin;$env:PATH"
+    }
+    if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+        Write-Host ""
+        Write-Host "[ERROR] uv のインストール後もコマンドが見つかりません。"
+        Write-Host "        ターミナルを再起動してから再度お試しください。"
+        Write-Host ""
+        Read-Host "続行するには Enter キーを押してください"
+        exit 1
+    }
+    Write-Host "  インストール完了。"
 }
-
-& $PyVenvExe '-m' 'pip' 'install' '--upgrade' 'pip' '--quiet'
+$uvVer = uv --version 2>&1
+Write-Host "  $uvVer"
 Write-Host ""
 
 # ============================================================
-# Step 3: ffmpeg
+# Step 2: ffmpeg
 # ============================================================
-Write-Host "[Step 3/5] ffmpeg を確認中..."
+Write-Host "[Step 2/4] ffmpeg を確認中..."
 
 if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
     Write-Host "  ffmpeg は既にインストール済みです。スキップします。"
@@ -109,61 +81,45 @@ if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
 Write-Host ""
 
 # ============================================================
-# Step 4: PyTorch (CUDA 12.8)
+# Step 3: 仮想環境 (uv venv)
 # ============================================================
-Write-Host "[Step 4/5] PyTorch を確認中..."
+Write-Host "[Step 3/4] 仮想環境を確認中..."
 
-$torchVer = & $PyVenvExe '-c' 'import torch; print(torch.__version__)' 2>&1
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "  PyTorch $torchVer は既にインストール済みです。スキップします。"
+$venvDir = Join-Path $RepoDir '.venv'
+if (Test-Path $venvDir) {
+    Write-Host "  .venv は既に存在します。スキップします。"
 } else {
-    Write-Host "  CUDA 12.x 対応 GPU 用の PyTorch をインストールします。"
-    Write-Host "  異なる CUDA バージョンや CPU 環境の場合は手動インストールしてください:"
-    Write-Host "  https://pytorch.org/get-started/locally/"
-    Write-Host ""
-    & $PipExe install --upgrade typing-extensions --quiet
-    & $PipExe install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+    Write-Host "  .venv を作成します (uv venv)..."
+    Set-Location $RepoDir
+    uv venv --python 3.10
     if ($LASTEXITCODE -ne 0) {
         Write-Host ""
-        Write-Host "[ERROR] PyTorch のインストールに失敗しました。"
-        Write-Host "        ネットワーク環境や CUDA バージョンを確認してください。"
+        Write-Host "[ERROR] 仮想環境の作成に失敗しました。"
+        Write-Host "        Python 3.10 以上がインストールされているか確認してください。"
         Read-Host "続行するには Enter キーを押してください"
         exit 1
     }
+    Write-Host "  仮想環境を作成しました。"
 }
 Write-Host ""
 
 # ============================================================
-# Step 5: 依存パッケージ
+# Step 4: 依存パッケージ (uv sync)
 # ============================================================
-Write-Host "[Step 5/5] 依存パッケージを確認中..."
+Write-Host "[Step 4/4] 依存パッケージを確認中 (uv sync)..."
+Write-Host "  ※ 初回は PyTorch (CUDA 12.8) を含む全パッケージをダウンロードします"
+Write-Host "  ※ CPU 環境や別の CUDA バージョンの場合は pyproject.toml を編集してください"
+Write-Host "     参考: https://pytorch.org/get-started/locally/"
+Write-Host ""
 
-$reqFile    = Join-Path $RepoDir 'requirements.txt'
-$tmpReqFile = Join-Path $RepoDir '.requirements_local.txt'
-$hashFile   = Join-Path $VenvDir '.req_hash'
-
-$reqHash    = (Get-FileHash $reqFile -Algorithm MD5).Hash
-$storedHash = if (Test-Path $hashFile) { (Get-Content $hashFile -Raw).Trim() } else { '' }
-
-if ($reqHash -eq $storedHash) {
-    Write-Host "  依存パッケージは最新です。スキップします。"
-} else {
-    (Get-Content $reqFile -Encoding UTF8) |
-        Where-Object { $_.Trim() -notmatch '^wandb' } |
-        Set-Content $tmpReqFile -Encoding UTF8
-
-    & $PipExe install --upgrade protobuf --quiet
-    & $PipExe install --extra-index-url https://download.pytorch.org/whl/cu128 -r $tmpReqFile
-    $pipErr = $LASTEXITCODE
-    Remove-Item $tmpReqFile -Force -ErrorAction SilentlyContinue
-
-    if ($pipErr -ne 0) {
-        Write-Host ""
-        Write-Host "[WARNING] 一部パッケージのインストールに失敗した可能性があります。"
-        Write-Host "          torchcodec が Windows 環境で利用不可の場合があります。"
-    } else {
-        [System.IO.File]::WriteAllText($hashFile, $reqHash)
-    }
+Set-Location $RepoDir
+uv sync --no-dev
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "[ERROR] uv sync に失敗しました。"
+    Write-Host "        ネットワーク環境や CUDA バージョンを確認してください。"
+    Read-Host "続行するには Enter キーを押してください"
+    exit 1
 }
 Write-Host ""
 
@@ -177,7 +133,6 @@ Write-Host "============================================================"
 $pyScript = Join-Path $env:TEMP 'irodori_dl.py'
 @'
 from huggingface_hub import hf_hub_download, try_to_load_from_cache
-from huggingface_hub.constants import HF_HUB_CACHE
 from huggingface_hub.errors import LocalEntryNotFoundError
 
 MODELS = [
@@ -205,7 +160,7 @@ else:
         print(f"          完了: {p}")
     print("  ダウンロード完了！")
 '@ | Set-Content $pyScript -Encoding UTF8
-& $PyVenvExe $pyScript
+uv run python $pyScript
 Remove-Item $pyScript -Force -ErrorAction SilentlyContinue
 Write-Host ""
 
@@ -215,10 +170,7 @@ Write-Host ""
 $ServerHost = '0.0.0.0'
 $ServerPort = 7860
 
-Set-Location $RepoDir
-. $ActivatePs
-
-python gradio_app_yuupro.py --server-name $ServerHost --server-port $ServerPort @args
+uv run python gradio_app_yuupro.py --server-name $ServerHost --server-port $ServerPort @args
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""
