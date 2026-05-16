@@ -1188,10 +1188,12 @@ def _load_audio(path: str | Path) -> tuple[torch.Tensor, int]:
 def save_wav(path: str | Path, audio: torch.Tensor, sample_rate: int) -> Path:
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    audio_cpu = audio.detach().to(device="cpu", dtype=torch.float32)
     try:
-        torchaudio.save(str(out_path), audio, sample_rate)
+        torchaudio.save(str(out_path), audio_cpu, sample_rate)
     except RuntimeError:
         import soundfile as sf
 
-        sf.write(str(out_path), audio.squeeze(0).numpy(), sample_rate)
+        audio_np = audio_cpu.squeeze(0).numpy() if audio_cpu.shape[0] == 1 else audio_cpu.T.numpy()
+        sf.write(str(out_path), audio_np, sample_rate)
     return out_path
