@@ -202,7 +202,7 @@ def load_ref_preset(name):
 # 音声生成関数
 # ==========================================
 
-def generate_base(text, ref_audio, num_steps, cfg_t, cfg_s, seed_raw, speed, dict_text, save_audio):
+def generate_base(text, ref_audio, num_steps, cfg_t, cfg_s, seed_raw, speed, dict_text, save_audio, max_seconds, specified_seconds):
     if not text or not text.strip():
         raise gr.Error("テキストを入力してください")
     original = text.strip()
@@ -216,11 +216,16 @@ def generate_base(text, ref_audio, num_steps, cfg_t, cfg_s, seed_raw, speed, dic
             seed = int(seed_raw.strip())
         except ValueError:
             pass
+    seconds = float(specified_seconds) if specified_seconds and float(specified_seconds) > 0 else None
+    effective_max_seconds = float(max_seconds)
+    if seconds is not None and seconds > effective_max_seconds:
+        effective_max_seconds = seconds
     result = runtime.synthesize(SamplingRequest(
         text=processed, ref_wav=ref, ref_latent=None, no_ref=no_ref,
         ref_normalize_db=-16.0, ref_ensure_max=True,
         num_candidates=1, decode_mode="sequential",
-        seconds=None, max_ref_seconds=30.0, max_text_len=None,
+        seconds=seconds, max_ref_seconds=30.0, max_text_len=None,
+        max_seconds=effective_max_seconds,
         num_steps=int(num_steps), seed=seed,
         cfg_guidance_mode="independent",
         cfg_scale_text=float(cfg_t), cfg_scale_speaker=float(cfg_s),
@@ -234,6 +239,8 @@ def generate_base(text, ref_audio, num_steps, cfg_t, cfg_s, seed_raw, speed, dic
     mode = "参照あり" if not no_ref else "参照なし"
     save_loc = "📁ローカル保存" if save_audio else "🗑️保存なし(一時表示)"
     info = f"🎤 ベースモデル({mode}) | Seed: {result.used_seed} | 生成: {result.total_to_decode:.1f}秒 | {save_loc}"
+    if seconds is not None:
+        info += f" | 指定長さ: {seconds:.1f}秒"
     if abs(speed - 1.0) >= 0.01:
         info += f" | 話速: {speed:.1f}x" + ("" if _FFMPEG_AVAILABLE else " (ffmpeg未検出のため無効)")
     if original != processed:
@@ -380,6 +387,14 @@ def build_ui():
                                 b_steps = gr.Slider(1, 120, 40, step=1, label="Num Steps")
                                 b_cfg_t = gr.Slider(0.0, 10.0, 3.0, step=0.1, label="CFG Text")
                                 b_cfg_s = gr.Slider(0.0, 10.0, 5.0, step=0.1, label="CFG Speaker")
+                            b_max_seconds = gr.Slider(
+                                5, 120, 30, step=5,
+                                label="⏱️ 最大生成時間 (秒) ※30秒超はトレーニング範囲外のため品質が低下する場合があります",
+                            )
+                            b_seconds = gr.Number(
+                                value=0, minimum=0, maximum=300, step=0.5,
+                                label="⏱️ 指定長さ (秒) ※0=自動（duration予測に従う）",
+                            )
                             b_seed = gr.Textbox(label="Seed（空欄=ランダム）", value="")
                         b_btn = gr.Button("🎵 音声を生成", variant="primary", size="lg")
                     with gr.Column(scale=2):
@@ -442,7 +457,7 @@ def build_ui():
 
         b_btn.click(
             generate_base,
-            [b_text, b_ref, b_steps, b_cfg_t, b_cfg_s, b_seed, b_speed, dict_input, b_save],
+            [b_text, b_ref, b_steps, b_cfg_t, b_cfg_s, b_seed, b_speed, dict_input, b_save, b_max_seconds, b_seconds],
             [b_out, b_info],
         )
         v_btn.click(
