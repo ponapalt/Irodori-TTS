@@ -38,6 +38,7 @@ Use either `--checkpoint` or `--hf-checkpoint`, not both.
 | `--ref-wav` | `None` | Reference waveform used for speaker/style conditioning in the base model. |
 | `--ref-latent` | `None` | Precomputed reference latent (`.pt`) used instead of encoding `--ref-wav` at inference time. Useful for repeated inference with the same reference. |
 | `--no-ref` | `False` | Disables speaker/reference conditioning. Use this for VoiceDesign checkpoints, or for text-only inference with base checkpoints. |
+| `--ref-embed` | `None` | Speaker Inversion embedding (`.speaker.safetensors`) path. Mutually exclusive with `--ref-wav`, `--ref-latent`, and `--no-ref`. Use the file produced by Speaker Inversion training instead of a reference waveform. |
 | `--max-ref-seconds` | `30.0` | Caps the reference audio duration before encoding. The released models were trained on audio up to 30 seconds, so keeping the default cap is recommended. Set `<=0` only when you intentionally want to disable the cap. |
 | `--ref-normalize-db` | `-16.0` | Loudness target applied to reference audio before DACVAE encode. This normalization was used when training the codec, so keeping the default is recommended. Use `none` only for controlled experiments. |
 | `--ref-ensure-max` | `True` | When loudness normalization is disabled, scales the reference down only if peak amplitude exceeds `1.0`. In normal use, prefer leaving loudness normalization enabled instead of relying on this fallback. |
@@ -142,6 +143,16 @@ for speaker-conditioned checkpoints with reference conditioning enabled. If the 
 voice drifts from the reference, try moderate `--speaker-kv-scale` values before making
 large CFG changes.
 
+### Speaker Inversion
+
+Speaker Inversion trains a compact set of learned tokens that represent a speaker identity.
+At inference, load the resulting `.speaker.safetensors` file with `--ref-embed` instead of
+a reference waveform.
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `--speaker-uncond-mode` | `mask` | Unconditional speaker formulation for CFG when using `--ref-embed`. `mask`: zero tokens with a false mask (default, lower VRAM). `noise`: Gaussian noise scaled to the standard deviation of the embedding. |
+
 ### Devices, Precision, and Compilation
 
 | Parameter | Default | Notes |
@@ -238,6 +249,7 @@ their natural lengths.
 | `precision` / `--precision` | `bf16` | Forward-pass compute precision. Weights and optimizer states remain FP32. |
 | `allow_tf32` / `--tf32` | `False` | Enables TF32 CUDA kernels for speed. |
 | `compile_model` / `--compile-model` | `False` | Enables `torch.compile` during training. |
+| `gradient_checkpointing` / `--gradient-checkpointing` | `False` | Enables activation checkpointing on diffusion blocks to reduce memory usage at the cost of extra compute. |
 | `optimizer` / `--optimizer` | `muon` | `muon` or `adamw`. |
 | `learning_rate` / `--lr` | `1e-4` | Base learning rate. |
 | `weight_decay` / `--weight-decay` | `0.01` | Weight decay for optimizer groups that use it. |
@@ -336,6 +348,24 @@ Common presets:
 LoRA checkpoints are saved as adapter directories. During conversion, adapter weights are
 merged into the base model so the exported `.safetensors` can be used directly for
 inference.
+
+### Speaker Inversion
+
+Speaker Inversion freezes the entire model and trains only a small set of learned speaker
+embedding tokens. The output is a `.speaker.safetensors` file used at inference with
+`--ref-embed`. An example config is provided at
+`configs/train_500m_v3_speaker_inversion.yaml`.
+
+| Parameter / Field | Default in dataclass | Notes |
+|-------------------|----------------------|-------|
+| `speaker_inversion_enabled` / `--speaker-inversion` | `False` | Enables Speaker Inversion mode. All model parameters are frozen; only the speaker embedding tokens receive gradients. |
+| `speaker_inversion_tokens` / `--speaker-inversion-tokens` | `16` | Number of learned speaker embedding tokens. |
+| `speaker_inversion_init_std` / `--speaker-inversion-init-std` | `0.02` | Standard deviation for random initialization of the embedding tokens. |
+| `speaker_inversion_init_embedding` / `--speaker-inversion-init-embedding` | `None` | Path to an existing `.speaker.safetensors` to resume from or warm-start a new optimization. |
+
+Use `--init-checkpoint` with the base model weights and `--manifest` with audio from the
+target speaker. All condition dropout values should be set to `0.0` so the embedding
+learns to represent the target speaker unconditionally.
 
 ### Logging, Validation, and DDP
 
