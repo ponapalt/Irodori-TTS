@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Irodori-TTS ゆうぷろカスタム V1.4.0 - ローカル版
-Based on: IrodoriTTS_YuuproCustom_v1.4.0.ipynb
+Irodori-TTS ゆうぷろカスタム V2.0.0 - ローカル版
+Based on: IrodoriTTS_YuuproCustom_V2.0.0.ipynb
 Original: ゆうぷろ (https://www.youtube.com/@yuupro) with Antigravity
 Adapted for local use (no Google Drive)
 """
@@ -394,8 +394,8 @@ def build_ui():
     ffmpeg_status = "🎚️ 話速: 有効" if _FFMPEG_AVAILABLE else "🎚️ 話速: 無効(ffmpeg未検出)"
     speed_label_suffix = "" if _FFMPEG_AVAILABLE else " (ffmpeg未検出のため無効)"
 
-    with gr.Blocks(title="Irodori-TTS ゆうぷろカスタム V1.4.0 [ローカル版]") as app:
-        gr.Markdown("# 🎙️ Irodori-TTS ゆうぷろカスタム V1.4.0 [ローカル版]")
+    with gr.Blocks(title="Irodori-TTS ゆうぷろカスタム V2.0.0 [ローカル版]") as app:
+        gr.Markdown("# 🎙️ Irodori-TTS ゆうぷろカスタム V2.0.0 [ローカル版]")
         gr.Markdown(
             f"🎤 ボイスクローン / 🎨 ボイスデザイン / 😄 絵文字 / "
             f"{ffmpeg_status} / 📖 辞書 / 📝 プリセット / 📁 ローカル保存モード"
@@ -572,7 +572,7 @@ def build_ui():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Irodori-TTS ゆうぷろカスタム V1.4.0 [ローカル版]"
+        description="Irodori-TTS ゆうぷろカスタム V2.0.0 [ローカル版]"
     )
     parser.add_argument("--server-name", default="127.0.0.1", help="サーバーアドレス (デフォルト: 127.0.0.1)")
     parser.add_argument("--server-port", type=int, default=7860, help="ポート番号 (デフォルト: 7860)")
@@ -585,7 +585,7 @@ def main():
         os.environ["IRODORI_NO_WATERMARK"] = "1"
 
     print("=" * 60)
-    print("🎙️ Irodori-TTS ゆうぷろカスタム V1.4.0 [ローカル版]")
+    print("🎙️ Irodori-TTS ゆうぷろカスタム V2.0.0 [ローカル版]")
     print(f"   📁 出力先     : {OUTPUT_DIR}")
     print(f"   🎤 参照音声   : {REF_DIR}")
     print(f"   📖 辞書       : {DICT_FILE}")
