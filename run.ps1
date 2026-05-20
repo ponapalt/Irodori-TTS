@@ -9,7 +9,7 @@ $RepoDir = $PSScriptRoot
 
 Write-Host ""
 Write-Host "============================================================"
-Write-Host "  Irodori-TTS ゆうぷろカスタム V1.4.0 [ローカル版]"
+Write-Host "  Irodori-TTS ゆうぷろカスタム V2.0.0 [ローカル版]"
 Write-Host "============================================================"
 Write-Host ""
 
@@ -113,7 +113,7 @@ Write-Host "     参考: https://pytorch.org/get-started/locally/"
 Write-Host ""
 
 Set-Location $RepoDir
-uv sync --no-dev
+uv sync --no-dev --extra cu128
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""
     Write-Host "[ERROR] uv sync に失敗しました。"
