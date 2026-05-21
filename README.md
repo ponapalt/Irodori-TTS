@@ -54,12 +54,8 @@ Audio is represented as continuous latent sequences via the codec configured by 
 ```bash
 git clone https://github.com/Aratako/Irodori-TTS.git
 cd Irodori-TTS
-uv sync
+uv sync --extra cu128  # NVIDIA CUDA 12.8 (Linux/Windows)
 ```
-
-**Compatibility note**: `uv sync` installs PyTorch from the default PyPI
-resolution path. To explicitly use the PyTorch CUDA 12.8 index on NVIDIA GPUs,
-run `uv sync --extra cu128`.
 
 If you want to explicitly select a PyTorch backend, use one of the backend
 extras below:
