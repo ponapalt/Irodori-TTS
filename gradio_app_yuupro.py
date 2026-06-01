@@ -38,7 +38,7 @@ for _d in [OUTPUT_DIR, REF_DIR]:
     Path(_d).mkdir(parents=True, exist_ok=True)
 
 BASE_REPO = "Aratako/Irodori-TTS-500M-v3"
-VD_REPO = "Aratako/Irodori-TTS-500M-v2-VoiceDesign"
+VD_REPO = "Aratako/Irodori-TTS-600M-v3-VoiceDesign"
 CODEC_REPO = "Aratako/Semantic-DACVAE-Japanese-32dim"
 _current_repo = None
 
@@ -299,13 +299,17 @@ def generate_base(text, ref_audio, speaker_embed_file, speaker_embed_path_text, 
     return path, info
 
 
-def generate_vd(text, caption, num_steps, cfg_t, cfg_c, seed_raw, speed, dict_text, save_audio, t_schedule_mode, sway_coeff):
+def generate_vd(text, caption, ref_audio, num_steps, cfg_t, cfg_c, cfg_s, seed_raw, speed, dict_text, save_audio, t_schedule_mode, sway_coeff):
     if not text or not text.strip():
         raise gr.Error("テキストを入力してください")
     original = text.strip()
     processed = apply_dict(original, dict_text)
     runtime = _ensure_model(VD_REPO)
     cap = caption.strip() if caption and caption.strip() else None
+    ref = str(ref_audio) if ref_audio and str(ref_audio).strip() else None
+    no_ref = ref is None or not runtime.model_cfg.use_speaker_condition_resolved
+    if no_ref:
+        ref = None
     seed = None
     if seed_raw and seed_raw.strip():
         try:
@@ -314,14 +318,15 @@ def generate_vd(text, caption, num_steps, cfg_t, cfg_c, seed_raw, speed, dict_te
             pass
     result = runtime.synthesize(SamplingRequest(
         text=processed, caption=cap,
-        ref_wav=None, ref_latent=None, no_ref=True,
+        ref_wav=ref, ref_latent=None, no_ref=no_ref,
         ref_normalize_db=-16.0, ref_ensure_max=True,
         num_candidates=1, decode_mode="sequential",
         seconds=None, max_ref_seconds=30.0,
         max_text_len=None, max_caption_len=None,
         num_steps=int(num_steps), seed=seed,
         cfg_guidance_mode="independent",
-        cfg_scale_text=float(cfg_t), cfg_scale_caption=float(cfg_c), cfg_scale_speaker=0.0,
+        cfg_scale_text=float(cfg_t), cfg_scale_caption=float(cfg_c),
+        cfg_scale_speaker=0.0 if no_ref else float(cfg_s),
         cfg_scale=None, cfg_min_t=0.5, cfg_max_t=1.0,
         truncation_factor=None, rescale_k=None, rescale_sigma=None,
         context_kv_cache=True,
@@ -332,8 +337,9 @@ def generate_vd(text, caption, num_steps, cfg_t, cfg_c, seed_raw, speed, dict_te
     ), log_fn=lambda m: print(m, flush=True))
     path = apply_speed(_save(result, "vd", save_audio), speed)
     ci = "キャプションあり" if cap else "キャプションなし"
+    speaker_mode = "参照あり" if not no_ref else "参照なし"
     save_loc = "📁ローカル保存" if save_audio else "🗑️保存なし(一時表示)"
-    info = f"🎨 VoiceDesign({ci}) | Seed: {result.used_seed} | 生成: {result.total_to_decode:.1f}秒 | {save_loc}"
+    info = f"🎨 VoiceDesign({ci}/{speaker_mode}) | Seed: {result.used_seed} | 生成: {result.total_to_decode:.1f}秒 | {save_loc}"
     if abs(speed - 1.0) >= 0.01:
         info += f" | 話速: {speed:.1f}x" + ("" if _FFMPEG_AVAILABLE else " (ffmpeg未検出のため無効)")
     if original != processed:
@@ -505,6 +511,10 @@ def build_ui():
                             lambda p: gr.update() if CAPTION_PRESETS.get(p) is None else CAPTION_PRESETS.get(p, ""),
                             inputs=[v_preset], outputs=[v_cap],
                         )
+                        v_ref = gr.Audio(
+                            label="🎤 参照音声（任意、空欄=参照なしモード）",
+                            type="filepath",
+                        )
                         v_speed = gr.Slider(
                             0.5, 2.0, 1.0, step=0.1,
                             label=f"🎚️ 話速{speed_label_suffix}",
@@ -513,8 +523,9 @@ def build_ui():
                         with gr.Accordion("⚙️ パラメータ", open=False):
                             with gr.Row():
                                 v_steps = gr.Slider(1, 120, 40, step=1, label="Num Steps")
-                                v_cfg_t = gr.Slider(0.0, 10.0, 2.0, step=0.1, label="CFG Text")
+                                v_cfg_t = gr.Slider(0.0, 10.0, 3.0, step=0.1, label="CFG Text")
                                 v_cfg_c = gr.Slider(0.0, 10.0, 4.0, step=0.1, label="CFG Caption")
+                                v_cfg_s = gr.Slider(0.0, 10.0, 5.0, step=0.1, label="CFG Speaker")
                             v_seed = gr.Textbox(label="Seed（空欄=ランダム）", value="")
                             with gr.Row():
                                 v_t_schedule = gr.Dropdown(
@@ -561,7 +572,7 @@ def build_ui():
         )
         v_btn.click(
             generate_vd,
-            [v_text, v_cap, v_steps, v_cfg_t, v_cfg_c, v_seed, v_speed, dict_input, v_save, v_t_schedule, v_sway_coeff],
+            [v_text, v_cap, v_ref, v_steps, v_cfg_t, v_cfg_c, v_cfg_s, v_seed, v_speed, dict_input, v_save, v_t_schedule, v_sway_coeff],
             [v_out, v_info],
         )
 
