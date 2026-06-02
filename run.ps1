@@ -137,7 +137,7 @@ from huggingface_hub.errors import LocalEntryNotFoundError
 
 MODELS = [
     ("ベースモデル",  "Aratako/Irodori-TTS-500M-v3",            "model.safetensors"),
-    ("VoiceDesign", "Aratako/Irodori-TTS-500M-v2-VoiceDesign", "model.safetensors"),
+    ("VoiceDesign", "Aratako/Irodori-TTS-600M-v3-VoiceDesign", "model.safetensors"),
 ]
 
 missing = []
