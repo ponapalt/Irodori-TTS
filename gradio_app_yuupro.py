@@ -452,11 +452,11 @@ def build_ui():
                             0.5, 2.0, 1.0, step=0.1,
                             label=f"🎚️ 話速{speed_label_suffix}",
                         )
+                        b_cfg_t = gr.Slider(0.0, 10.0, 3.0, step=0.1, label="テキストと感情表現の効き具合 標準=3")
                         b_save = gr.Checkbox(label="💾 生成音声をフォルダに自動保存する", value=True)
                         with gr.Accordion("⚙️ パラメータ", open=False):
                             with gr.Row():
                                 b_steps = gr.Slider(1, 120, 40, step=1, label="Num Steps")
-                                b_cfg_t = gr.Slider(0.0, 10.0, 3.0, step=0.1, label="CFG Text")
                                 b_cfg_s = gr.Slider(0.0, 10.0, 5.0, step=0.1, label="CFG Speaker")
                             b_max_seconds = gr.Slider(
                                 5, 120, 30, step=5,
@@ -501,10 +501,10 @@ def build_ui():
                         v_preset = gr.Dropdown(
                             choices=list(CAPTION_PRESETS.keys()),
                             value="（プリセットを選択）",
-                            label="📝 キャプションプリセット",
+                            label="📝 説明文プリセット",
                         )
                         v_cap = gr.Textbox(
-                            label="🎨 キャプション", lines=3,
+                            label="🎨 作りたい音声スタイルの説明文", lines=3,
                             placeholder="どんな声で読むか指示...",
                         )
                         v_preset.change(
@@ -519,12 +519,12 @@ def build_ui():
                             0.5, 2.0, 1.0, step=0.1,
                             label=f"🎚️ 話速{speed_label_suffix}",
                         )
+                        v_cfg_t = gr.Slider(0.0, 10.0, 3.0, step=0.1, label="テキストと感情表現の効き具合 標準=3")
+                        v_cfg_c = gr.Slider(0.0, 10.0, 4.0, step=0.1, label="音声スタイルの効き具合 標準=4")
                         v_save = gr.Checkbox(label="💾 生成音声をフォルダに自動保存する", value=True)
                         with gr.Accordion("⚙️ パラメータ", open=False):
                             with gr.Row():
                                 v_steps = gr.Slider(1, 120, 40, step=1, label="Num Steps")
-                                v_cfg_t = gr.Slider(0.0, 10.0, 3.0, step=0.1, label="CFG Text")
-                                v_cfg_c = gr.Slider(0.0, 10.0, 4.0, step=0.1, label="CFG Caption")
                                 v_cfg_s = gr.Slider(0.0, 10.0, 5.0, step=0.1, label="CFG Speaker")
                             v_seed = gr.Textbox(label="Seed（空欄=ランダム）", value="")
                             with gr.Row():
