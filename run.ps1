@@ -160,7 +160,7 @@ else:
         print(f"          完了: {p}")
     print("  ダウンロード完了！")
 '@ | Set-Content $pyScript -Encoding UTF8
-uv run --extra cu128 python $pyScript
+uv run --no-sync python $pyScript
 Remove-Item $pyScript -Force -ErrorAction SilentlyContinue
 Write-Host ""
 
@@ -170,7 +170,7 @@ Write-Host ""
 $ServerHost = '0.0.0.0'
 $ServerPort = 7860
 
-uv run --extra cu128 python gradio_app_yuupro.py --server-name $ServerHost --server-port $ServerPort @args
+uv run --no-sync python gradio_app_yuupro.py --server-name $ServerHost --server-port $ServerPort @args
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""
