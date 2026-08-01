@@ -338,13 +338,17 @@ def _on_tone_preset_selected(preset_id):
 
 
 def _on_tone_favorite_toggle(preset_id):
+    """結果はトースト通知で返す（専用のステータス欄を置くと縦幅を常時占有するため）。"""
     if not preset_id:
-        return "⚠️ プリセットを選択してください", gr.update()
+        gr.Warning("プリセットを選択してください")
+        return
     is_fav = TONE_LIBRARY.toggle_favorite(preset_id)
     preset = get_tone_preset(preset_id)
     name = preset.name if preset else preset_id
-    msg = f"⭐ 「{name}」をお気に入りに追加しました" if is_fav else f"☆ 「{name}」をお気に入りから解除しました"
-    return msg, gr.update()
+    if is_fav:
+        gr.Info(f"⭐ 「{name}」をお気に入りに追加しました")
+    else:
+        gr.Info(f"☆ 「{name}」をお気に入りから解除しました")
 
 
 def _on_tone_mode_change(mode):
@@ -365,7 +369,8 @@ def _on_custom_axis_change(source, extra_text, emotion, brightness, pitch, speed
         intensity=intensity,
         last_changed=source,
     )
-    return result.caption, "\n".join(result.warnings)
+    warn_text = "\n".join(result.warnings)
+    return result.caption, gr.update(value=warn_text, visible=bool(warn_text))
 
 
 def _on_t_schedule_mode_change(mode: str) -> object:
@@ -570,7 +575,7 @@ def generate_vd(model_choice, text, caption, ref_audio, extra_refs, num_steps, c
         info += f" | 話速: {speed:.1f}x" + ("" if _FFMPEG_AVAILABLE else " (ffmpeg未検出のため無効)")
     if original != processed:
         info += f"\n📖 辞書適用後: {processed}"
-    return path, info, (caption_warning or "")
+    return path, info, gr.update(value=caption_warning or "", visible=bool(caption_warning))
 
 
 # --- 絵文字パレット ---
@@ -622,11 +627,43 @@ def _get_private_ips():
     return ips
 
 
+# 左カラム（入力・設定）が縦に長いため、右カラム（生成結果）を画面に貼り付けたまま
+# スクロールできるようにする。max-height を付けないと、カラム自体がビューポートより
+# 高くなったときに sticky が効かなくなる。
+CUSTOM_CSS = """
+/* Gradio 6 の .gradio-container は overflow:hidden を持っており、それ自体がスクロール
+   ポートになるため、中の sticky 要素がビューポートではなくこのコンテナ基準になってしまう
+   （＝コンテナは内容と同じ高さなので sticky が一切効かない）。横方向のクリップだけ
+   overflow-x:clip で維持しつつ、縦を visible に戻して解除する。
+   clip 未対応ブラウザは先行の overflow:visible にフォールバックする。 */
+.gradio-container {
+    overflow: visible !important;
+    overflow-x: clip !important;
+    overflow-y: visible !important;
+}
+
+#b_out_col, #v_out_col {
+    position: sticky;
+    top: 8px;
+    align-self: flex-start;
+    max-height: calc(100vh - 24px);
+    overflow-y: auto;
+}
+@media (max-width: 768px) {
+    #b_out_col, #v_out_col {
+        position: static;
+        max-height: none;
+        overflow-y: visible;
+    }
+}
+"""
+
+
 def build_ui():
     ffmpeg_status = "🎚️ 話速: 有効" if _FFMPEG_AVAILABLE else "🎚️ 話速: 無効(ffmpeg未検出)"
     speed_label_suffix = "" if _FFMPEG_AVAILABLE else " (ffmpeg未検出のため無効)"
 
-    with gr.Blocks(title="Irodori-TTS ゆうぷろカスタム V2.0.0 [ローカル版]") as app:
+    with gr.Blocks(title="Irodori-TTS ゆうぷろカスタム V2.0.0 [ローカル版]", css=CUSTOM_CSS) as app:
         gr.Markdown("# 🎙️ Irodori-TTS ゆうぷろカスタム V2.0.0 [ローカル版]")
         gr.Markdown(
             f"🎤 ボイスクローン / 🎨 ボイスデザイン / 😄 絵文字 / "
@@ -744,8 +781,8 @@ def build_ui():
                                     interactive=False,
                                 )
                             b_lora_adapter = gr.Textbox(label="LoRA Adapter Directory (optional)", value="")
+                    with gr.Column(scale=2, elem_id="b_out_col"):
                         b_btn = gr.Button("🎵 音声を生成", variant="primary", size="lg")
-                    with gr.Column(scale=2):
                         b_out = gr.Audio(label="🔈 生成音声", type="filepath")
                         b_info = gr.Textbox(label="ℹ️ 生成情報", interactive=False, lines=3)
 
@@ -785,30 +822,30 @@ def build_ui():
 
                         with gr.Group(visible=True) as v_tone_preset_panel:
                             with gr.Row():
-                                v_tone_search = gr.Textbox(
-                                    label="🔍 プリセット名で検索", placeholder="例: 明るい、ナレーション...",
-                                    scale=2,
-                                )
-                                v_tone_category = gr.Dropdown(
-                                    choices=[_ALL_CATEGORIES_LABEL] + list(CATEGORIES.values()),
-                                    value=_ALL_CATEGORIES_LABEL,
-                                    label="📂 カテゴリで絞り込み", scale=2,
-                                )
-                                v_tone_fav_only = gr.Checkbox(label="⭐ お気に入りのみ", value=False, scale=1)
-                            with gr.Row():
                                 v_tone_preset = gr.Dropdown(
                                     choices=_tone_preset_choices("", _ALL_CATEGORIES_LABEL, False),
                                     value="normal",
                                     label="🎭 声のトーン・感情プリセット", scale=3,
                                 )
                                 v_tone_fav_btn = gr.Button("⭐ お気に入り登録/解除", scale=1)
-                            v_tone_recent = gr.Dropdown(
-                                choices=_recent_tone_choices(),
-                                value=None,
-                                label="🕘 最近使ったプリセット（選択すると切り替え）",
-                            )
-                            v_tone_fav_status = gr.Textbox(label="", interactive=False, show_label=False)
                             v_tone_current = gr.Markdown(_describe_tone_preset("normal"))
+                            with gr.Accordion("🔍 検索・絞り込み・履歴", open=False):
+                                with gr.Row():
+                                    v_tone_search = gr.Textbox(
+                                        label="🔍 プリセット名で検索", placeholder="例: 明るい、ナレーション...",
+                                        scale=2,
+                                    )
+                                    v_tone_category = gr.Dropdown(
+                                        choices=[_ALL_CATEGORIES_LABEL] + list(CATEGORIES.values()),
+                                        value=_ALL_CATEGORIES_LABEL,
+                                        label="📂 カテゴリで絞り込み", scale=2,
+                                    )
+                                    v_tone_fav_only = gr.Checkbox(label="⭐ お気に入りのみ", value=False, scale=1)
+                                v_tone_recent = gr.Dropdown(
+                                    choices=_recent_tone_choices(),
+                                    value=None,
+                                    label="🕘 最近使ったプリセット（選択すると切り替え）",
+                                )
 
                         with gr.Group(visible=False) as v_tone_custom_panel:
                             gr.Markdown("✏️ 任意のcaptionを直接入力するか、下記の調整項目から自動生成します。")
@@ -820,24 +857,27 @@ def build_ui():
                                 choices=[(label, eid) for eid, label, _phrase, _pol in EMOTION_CHOICES],
                                 value="none", label="感情",
                             )
-                            with gr.Row():
-                                v_custom_brightness = gr.Slider(-1.0, 1.0, 0.0, step=0.05, label="明るさ（暗い ←→ 明るい）")
-                                v_custom_pitch = gr.Slider(-1.0, 1.0, 0.0, step=0.05, label="声の高さ（低い ←→ 高い）")
-                            with gr.Row():
-                                v_custom_speed = gr.Slider(-1.0, 1.0, 0.0, step=0.05, label="話速（遅い ←→ 速い）")
-                                v_custom_volume = gr.Slider(-1.0, 1.0, 0.0, step=0.05, label="声量（小さい ←→ 大きい）")
-                            with gr.Row():
-                                v_custom_intonation = gr.Slider(0.0, 1.0, 0.5, step=0.05, label="抑揚の強さ")
-                                v_custom_breath = gr.Slider(0.0, 1.0, 0.3, step=0.05, label="息の多さ")
-                            v_custom_intensity = gr.Slider(0.0, 1.0, 0.5, step=0.05, label="感情の強度")
-                            v_custom_warn = gr.Textbox(label="⚠️ 矛盾警告", interactive=False, visible=True)
+                            with gr.Accordion("🎛️ 詳細な調整軸", open=False):
+                                with gr.Row():
+                                    v_custom_brightness = gr.Slider(-1.0, 1.0, 0.0, step=0.05, label="明るさ（暗い ←→ 明るい）")
+                                    v_custom_pitch = gr.Slider(-1.0, 1.0, 0.0, step=0.05, label="声の高さ（低い ←→ 高い）")
+                                with gr.Row():
+                                    v_custom_speed = gr.Slider(-1.0, 1.0, 0.0, step=0.05, label="話速（遅い ←→ 速い）")
+                                    v_custom_volume = gr.Slider(-1.0, 1.0, 0.0, step=0.05, label="声量（小さい ←→ 大きい）")
+                                with gr.Row():
+                                    v_custom_intonation = gr.Slider(0.0, 1.0, 0.5, step=0.05, label="抑揚の強さ")
+                                    v_custom_breath = gr.Slider(0.0, 1.0, 0.3, step=0.05, label="息の多さ")
+                                v_custom_intensity = gr.Slider(0.0, 1.0, 0.5, step=0.05, label="感情の強度")
+                            # 矛盾があるときだけ表示する（常時表示だと空枠が縦幅を食うため）
+                            v_custom_warn = gr.Textbox(label="⚠️ 矛盾警告", interactive=False, visible=False)
 
                         v_cap = gr.Textbox(
                             label="🎨 実際に送信されるcaption（作りたい音声スタイルの説明文）",
                             lines=3, value=get_tone_preset("normal").caption,
                             placeholder="どんな声で読むか指示...",
                         )
-                        v_warn = gr.Textbox(label="⚠️ 警告", interactive=False, visible=True)
+                        # 警告が出たときだけ表示する
+                        v_warn = gr.Textbox(label="⚠️ 警告", interactive=False, visible=False)
 
                         v_speed = gr.Slider(
                             0.5, 2.0, 1.0, step=0.1,
@@ -862,13 +902,12 @@ def build_ui():
                                     minimum=-1.0, maximum=1.5, value=-1.0, step=0.1,
                                     interactive=False,
                                 )
-                        with gr.Row():
-                            v_btn = gr.Button("🎵 音声を生成", variant="primary", size="lg")
-                            v_preview_btn = gr.Button("🔊 試聴（同じ文章で比較生成）", size="lg")
-                    with gr.Column(scale=2):
+                    with gr.Column(scale=2, elem_id="v_out_col"):
+                        v_btn = gr.Button("🎵 音声を生成", variant="primary", size="lg")
                         v_out = gr.Audio(label="🔈 生成音声", type="filepath")
                         v_info = gr.Textbox(label="ℹ️ 生成情報", interactive=False, lines=3)
                         gr.Markdown("---")
+                        v_preview_btn = gr.Button("🔊 試聴（同じ文章で比較生成）", size="lg")
                         v_preview_out = gr.Audio(label="🔊 試聴（比較用、上の結果は上書きされません）", type="filepath")
                         v_preview_info = gr.Textbox(label="ℹ️ 試聴情報", interactive=False, lines=3)
 
@@ -887,9 +926,7 @@ def build_ui():
                     outputs=[v_cap, v_tone_current, v_tone_recent],
                 )
                 v_tone_recent.change(lambda pid: pid, inputs=[v_tone_recent], outputs=[v_tone_preset])
-                v_tone_fav_btn.click(
-                    _on_tone_favorite_toggle, inputs=[v_tone_preset], outputs=[v_tone_fav_status, v_tone_preset],
-                )
+                v_tone_fav_btn.click(_on_tone_favorite_toggle, inputs=[v_tone_preset])
 
                 _custom_inputs = [
                     v_custom_extra, v_custom_emotion, v_custom_brightness, v_custom_pitch,
