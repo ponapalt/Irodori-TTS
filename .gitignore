@@ -217,5 +217,11 @@ __marimo__/
 
 gradio_outputs/
 gradio_outputs_voicedesign/
+temp_outputs/
 outputs/
 data/
+
+# ゆうぷろカスタム ローカル実行時に生成される設定ファイル
+dictionary.txt
+ref_audio_presets/
+tone_library.json

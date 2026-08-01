@@ -6,17 +6,18 @@ Original: ゆうぷろ (https://www.youtube.com/@yuupro) with Antigravity
 Adapted for local use (no Google Drive)
 """
 
-import sys
-import os
+import argparse
+import functools
 import gc
+import os
 import shutil
 import socket
 import subprocess as sp
-import argparse
-from pathlib import Path
+import sys
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 REPO_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_DIR))
@@ -28,11 +29,19 @@ from irodori_tts.inference_runtime import (
     RuntimeKey, SamplingRequest, clear_cached_runtime,
     default_runtime_device, download_hf_checkpoint, get_cached_runtime, save_wav,
 )
+from irodori_tts.tone_custom import EMOTION_CHOICES, build_custom_caption
+from irodori_tts.tone_library import ToneLibraryStore, search_presets
+# get_preset はモデルプリセット取得用に既存の同名関数があるため別名で取り込む
+from irodori_tts.tone_presets import CATEGORIES, category_label
+from irodori_tts.tone_presets import get_preset as get_tone_preset
+from irodori_tts.tone_request import build_vd_request_kwargs, check_caption_support
 
 # --- ローカル設定 ---
 OUTPUT_DIR = str(REPO_DIR / "gradio_outputs")
 REF_DIR = str(REPO_DIR / "ref_audio_presets")
 DICT_FILE = str(REPO_DIR / "dictionary.txt")
+TONE_LIBRARY_FILE = str(REPO_DIR / "tone_library.json")
+TONE_LIBRARY = ToneLibraryStore(TONE_LIBRARY_FILE)
 
 for _d in [OUTPUT_DIR, REF_DIR]:
     Path(_d).mkdir(parents=True, exist_ok=True)
@@ -118,7 +127,7 @@ if not _FFMPEG_AVAILABLE:
 # --- 保存済み辞書の読込 ---
 SAVED_DICT = ""
 if os.path.exists(DICT_FILE):
-    with open(DICT_FILE, "r", encoding="utf-8") as f:
+    with open(DICT_FILE, encoding="utf-8") as f:
         SAVED_DICT = f.read()
 
 # --- 絵文字データ ---
@@ -140,7 +149,7 @@ EMOJI_GROUPS = [
     ]),
 ]
 
-# --- キャプションプリセット ---
+# --- キャプションプリセット（ベースモデルタブ用） ---
 CAPTION_PRESETS = OrderedDict([
     ("（プリセットを選択）", ""),
     ("─── 👩 女性 ───", None),
@@ -157,6 +166,13 @@ CAPTION_PRESETS = OrderedDict([
     ("🎭 ドラマチック朗読", "感情豊かに、ドラマチックに朗読する。"),
     ("📖 丁寧な朗読", "はっきりとした声で、丁寧に朗読する。"),
 ])
+
+# --- 声のトーン・感情プリセット（ボイスデザインタブ用） ---
+# プリセット本体（ID/表示名/カテゴリ/caption/説明文/推奨話速 等）は
+# irodori_tts/tone_presets.py に一元管理されている。ここでは表示用の
+# ヘルパーのみを定義する。
+_CATEGORY_LABEL_TO_ID = {label: cat_id for cat_id, label in CATEGORIES.items()}
+_ALL_CATEGORIES_LABEL = "すべて"
 
 # ==========================================
 # ユーティリティ関数
@@ -273,6 +289,83 @@ def load_ref_preset(name):
         return None
     p = Path(REF_DIR) / f"{name}.wav"
     return str(p) if p.exists() else None
+
+
+# --- 声のトーン・感情プリセット ブラウザ ---
+
+def _preset_label(preset):
+    return f"{preset.name} — {preset.description}"
+
+
+def _tone_preset_choices(query, category_label_value, favorites_only):
+    category_id = _CATEGORY_LABEL_TO_ID.get(category_label_value)
+    if category_label_value == _ALL_CATEGORIES_LABEL:
+        category_id = None
+    results = search_presets(
+        query=query,
+        category=category_id,
+        favorite_ids=set(TONE_LIBRARY.favorites()),
+        favorites_only=favorites_only,
+    )
+    return [(_preset_label(p), p.id) for p in results]
+
+
+def _on_tone_filter_change(query, category_label_value, favorites_only):
+    return gr.update(choices=_tone_preset_choices(query, category_label_value, favorites_only))
+
+
+def _describe_tone_preset(preset_id):
+    preset = get_tone_preset(preset_id)
+    if preset is None:
+        return "プリセットが選択されていません。"
+    return (
+        f"**🎯 現在選択中:** {preset.name}（{category_label(preset.category)}）\n\n"
+        f"{preset.description}"
+    )
+
+
+def _recent_tone_choices():
+    return [(get_tone_preset(pid).name, pid) for pid in TONE_LIBRARY.recent() if get_tone_preset(pid)]
+
+
+def _on_tone_preset_selected(preset_id):
+    preset = get_tone_preset(preset_id)
+    caption = preset.caption if preset else ""
+    desc = _describe_tone_preset(preset_id)
+    if preset_id:
+        TONE_LIBRARY.push_recent(preset_id)
+    return caption, desc, gr.update(choices=_recent_tone_choices())
+
+
+def _on_tone_favorite_toggle(preset_id):
+    if not preset_id:
+        return "⚠️ プリセットを選択してください", gr.update()
+    is_fav = TONE_LIBRARY.toggle_favorite(preset_id)
+    preset = get_tone_preset(preset_id)
+    name = preset.name if preset else preset_id
+    msg = f"⭐ 「{name}」をお気に入りに追加しました" if is_fav else f"☆ 「{name}」をお気に入りから解除しました"
+    return msg, gr.update()
+
+
+def _on_tone_mode_change(mode):
+    is_custom = str(mode).startswith("✏")
+    return gr.update(visible=not is_custom), gr.update(visible=is_custom)
+
+
+def _on_custom_axis_change(source, extra_text, emotion, brightness, pitch, speed, volume, intonation, breathiness, intensity):
+    result = build_custom_caption(
+        base_text=extra_text,
+        emotion=emotion,
+        brightness=brightness,
+        pitch=pitch,
+        speed=speed,
+        volume=volume,
+        intonation=intonation,
+        breathiness=breathiness,
+        intensity=intensity,
+        last_changed=source,
+    )
+    return result.caption, "\n".join(result.warnings)
 
 
 def _on_t_schedule_mode_change(mode: str) -> object:
@@ -431,45 +524,44 @@ def generate_vd(model_choice, text, caption, ref_audio, extra_refs, num_steps, c
     processed = apply_dict(original, dict_text)
     preset = get_preset(model_choice)
     runtime = _ensure_model(preset.design_source, preset.precision)
-    cap = caption.strip() if caption and caption.strip() else None
     # 追加参照音声はv4系のみ。v3選択時はUIを隠すが、値は送られてくるので明示的に無視する。
     refs = _resolve_ref_paths(ref_audio, extra_refs if preset.unified else None)
-    no_ref = not refs or not runtime.model_cfg.use_speaker_condition_resolved
-    if no_ref:
-        refs = []
     seed = None
     if seed_raw and seed_raw.strip():
         try:
             seed = int(seed_raw.strip())
         except ValueError:
             pass
-    result = runtime.synthesize(SamplingRequest(
-        text=processed, caption=cap,
-        ref_wav=None, ref_wavs=refs or None,
-        ref_latent=None, no_ref=no_ref,
-        ref_normalize_db=-16.0, ref_ensure_max=True,
-        num_candidates=1, decode_mode="sequential",
-        # None = チェックポイントの推奨値（v4-Small: 120秒 / v3以前: 30秒）
-        seconds=None, max_ref_seconds=None,
-        max_text_len=None, max_caption_len=None,
-        num_steps=int(num_steps), seed=seed,
-        cfg_guidance_mode="independent",
-        cfg_scale_text=float(cfg_t), cfg_scale_caption=float(cfg_c),
-        cfg_scale_speaker=0.0 if no_ref else float(cfg_s),
-        cfg_scale=None, cfg_min_t=0.5, cfg_max_t=1.0,
-        truncation_factor=None, rescale_k=None, rescale_sigma=None,
-        context_kv_cache=True,
-        speaker_kv_scale=None, speaker_kv_min_t=None, speaker_kv_max_layers=None,
-        t_schedule_mode=str(t_schedule_mode),
+
+    # 参照音声（話者の声質）とcaption（選択したトーン・感情プリセット、またはカスタム入力）は
+    # 常に同じリクエストへ同時に渡す。build_vd_request_kwargs はプレビュー("試聴")ボタンとも
+    # 共有しているため、両者のリクエスト形状が食い違うことはない。
+    kwargs = build_vd_request_kwargs(
+        text=processed,
+        caption=caption,
+        ref_wavs=refs,
+        speaker_condition_supported=runtime.model_cfg.use_speaker_condition_resolved,
+        cfg_scale_text=float(cfg_t),
+        cfg_scale_caption=float(cfg_c),
+        cfg_scale_speaker=float(cfg_s),
+        num_steps=int(num_steps),
+        seed=seed,
+        t_schedule_mode=t_schedule_mode,
         sway_coeff=float(sway_coeff),
-        trim_tail=True,
-    ), log_fn=lambda m: print(m, flush=True))
+    )
+    caption_warning = check_caption_support(runtime.model_cfg.use_caption_condition, kwargs["caption"])
+    if caption_warning:
+        print(f"[warning] {caption_warning}", flush=True)
+        gr.Warning(caption_warning)
+
+    result = runtime.synthesize(SamplingRequest(**kwargs), log_fn=lambda m: print(m, flush=True))
     path = apply_speed(_save(result, "vd", save_audio), speed)
-    ci = "説明文あり" if cap else "説明文なし"
-    if no_ref:
+    used_refs = kwargs["ref_wavs"] or []
+    ci = "説明文あり" if kwargs["caption"] else "説明文なし"
+    if kwargs["no_ref"]:
         speaker_mode = "参照なし"
-    elif len(refs) > 1:
-        speaker_mode = f"参照{len(refs)}本"
+    elif len(used_refs) > 1:
+        speaker_mode = f"参照{len(used_refs)}本"
     else:
         speaker_mode = "参照あり"
     save_loc = "📁ローカル保存" if save_audio else "🗑️保存なし(一時表示)"
@@ -478,7 +570,7 @@ def generate_vd(model_choice, text, caption, ref_audio, extra_refs, num_steps, c
         info += f" | 話速: {speed:.1f}x" + ("" if _FFMPEG_AVAILABLE else " (ffmpeg未検出のため無効)")
     if original != processed:
         info += f"\n📖 辞書適用後: {processed}"
-    return path, info
+    return path, info, (caption_warning or "")
 
 
 # --- 絵文字パレット ---
@@ -660,6 +752,12 @@ def build_ui():
             # ===== ボイスデザイン =====
             with gr.Tab("🎨 ボイスデザイン"):
                 gr.Markdown("### テキスト指示で声をデザインして音声生成")
+                gr.Markdown(
+                    "💡 参照音声を指定すると、話者の声質・声色はそのまま引き継ぎつつ、"
+                    "感情・テンション・話速・抑揚などは選択したトーン/感情プリセット（またはカスタム設定）が"
+                    "優先されます。参照音声とプリセットは同じ生成リクエストへ同時に渡され、どちらかを変更しても"
+                    "もう一方が失われることはありません。"
+                )
                 with gr.Row():
                     with gr.Column(scale=3):
                         v_text = gr.Textbox(
@@ -667,19 +765,7 @@ def build_ui():
                             placeholder="音声にしたいテキストを入力...", elem_id="v_text",
                         )
                         create_emoji_palette(v_text, "v_text")
-                        v_preset = gr.Dropdown(
-                            choices=list(CAPTION_PRESETS.keys()),
-                            value="（プリセットを選択）",
-                            label="📝 説明文プリセット",
-                        )
-                        v_cap = gr.Textbox(
-                            label="🎨 作りたい音声スタイルの説明文", lines=3,
-                            placeholder="どんな声で読むか指示...",
-                        )
-                        v_preset.change(
-                            lambda p: gr.update() if CAPTION_PRESETS.get(p) is None else CAPTION_PRESETS.get(p, ""),
-                            inputs=[v_preset], outputs=[v_cap],
-                        )
+
                         v_ref = gr.Audio(
                             label="🎤 参照音声（任意、空欄=参照なしモード）",
                             type="filepath",
@@ -690,6 +776,69 @@ def build_ui():
                             file_types=["audio"], allow_reordering=True,
                             visible=MODEL_PRESETS[DEFAULT_MODEL].unified,
                         )
+
+                        v_tone_mode = gr.Radio(
+                            ["🎭 プリセット", "✏️ カスタム"],
+                            value="🎭 プリセット",
+                            label="声のトーン・感情 設定モード",
+                        )
+
+                        with gr.Group(visible=True) as v_tone_preset_panel:
+                            with gr.Row():
+                                v_tone_search = gr.Textbox(
+                                    label="🔍 プリセット名で検索", placeholder="例: 明るい、ナレーション...",
+                                    scale=2,
+                                )
+                                v_tone_category = gr.Dropdown(
+                                    choices=[_ALL_CATEGORIES_LABEL] + list(CATEGORIES.values()),
+                                    value=_ALL_CATEGORIES_LABEL,
+                                    label="📂 カテゴリで絞り込み", scale=2,
+                                )
+                                v_tone_fav_only = gr.Checkbox(label="⭐ お気に入りのみ", value=False, scale=1)
+                            with gr.Row():
+                                v_tone_preset = gr.Dropdown(
+                                    choices=_tone_preset_choices("", _ALL_CATEGORIES_LABEL, False),
+                                    value="normal",
+                                    label="🎭 声のトーン・感情プリセット", scale=3,
+                                )
+                                v_tone_fav_btn = gr.Button("⭐ お気に入り登録/解除", scale=1)
+                            v_tone_recent = gr.Dropdown(
+                                choices=_recent_tone_choices(),
+                                value=None,
+                                label="🕘 最近使ったプリセット（選択すると切り替え）",
+                            )
+                            v_tone_fav_status = gr.Textbox(label="", interactive=False, show_label=False)
+                            v_tone_current = gr.Markdown(_describe_tone_preset("normal"))
+
+                        with gr.Group(visible=False) as v_tone_custom_panel:
+                            gr.Markdown("✏️ 任意のcaptionを直接入力するか、下記の調整項目から自動生成します。")
+                            v_custom_extra = gr.Textbox(
+                                label="自由記述（任意、下の調整結果に追記されます）",
+                                lines=2, placeholder="例: 語尾を伸ばして話す",
+                            )
+                            v_custom_emotion = gr.Dropdown(
+                                choices=[(label, eid) for eid, label, _phrase, _pol in EMOTION_CHOICES],
+                                value="none", label="感情",
+                            )
+                            with gr.Row():
+                                v_custom_brightness = gr.Slider(-1.0, 1.0, 0.0, step=0.05, label="明るさ（暗い ←→ 明るい）")
+                                v_custom_pitch = gr.Slider(-1.0, 1.0, 0.0, step=0.05, label="声の高さ（低い ←→ 高い）")
+                            with gr.Row():
+                                v_custom_speed = gr.Slider(-1.0, 1.0, 0.0, step=0.05, label="話速（遅い ←→ 速い）")
+                                v_custom_volume = gr.Slider(-1.0, 1.0, 0.0, step=0.05, label="声量（小さい ←→ 大きい）")
+                            with gr.Row():
+                                v_custom_intonation = gr.Slider(0.0, 1.0, 0.5, step=0.05, label="抑揚の強さ")
+                                v_custom_breath = gr.Slider(0.0, 1.0, 0.3, step=0.05, label="息の多さ")
+                            v_custom_intensity = gr.Slider(0.0, 1.0, 0.5, step=0.05, label="感情の強度")
+                            v_custom_warn = gr.Textbox(label="⚠️ 矛盾警告", interactive=False, visible=True)
+
+                        v_cap = gr.Textbox(
+                            label="🎨 実際に送信されるcaption（作りたい音声スタイルの説明文）",
+                            lines=3, value=get_tone_preset("normal").caption,
+                            placeholder="どんな声で読むか指示...",
+                        )
+                        v_warn = gr.Textbox(label="⚠️ 警告", interactive=False, visible=True)
+
                         v_speed = gr.Slider(
                             0.5, 2.0, 1.0, step=0.1,
                             label=f"🎚️ 話速{speed_label_suffix}",
@@ -713,10 +862,50 @@ def build_ui():
                                     minimum=-1.0, maximum=1.5, value=-1.0, step=0.1,
                                     interactive=False,
                                 )
-                        v_btn = gr.Button("🎵 音声を生成", variant="primary", size="lg")
+                        with gr.Row():
+                            v_btn = gr.Button("🎵 音声を生成", variant="primary", size="lg")
+                            v_preview_btn = gr.Button("🔊 試聴（同じ文章で比較生成）", size="lg")
                     with gr.Column(scale=2):
                         v_out = gr.Audio(label="🔈 生成音声", type="filepath")
                         v_info = gr.Textbox(label="ℹ️ 生成情報", interactive=False, lines=3)
+                        gr.Markdown("---")
+                        v_preview_out = gr.Audio(label="🔊 試聴（比較用、上の結果は上書きされません）", type="filepath")
+                        v_preview_info = gr.Textbox(label="ℹ️ 試聴情報", interactive=False, lines=3)
+
+                v_tone_mode.change(
+                    _on_tone_mode_change, inputs=[v_tone_mode], outputs=[v_tone_preset_panel, v_tone_custom_panel],
+                )
+                for _filter_comp in (v_tone_search, v_tone_category, v_tone_fav_only):
+                    _filter_comp.change(
+                        _on_tone_filter_change,
+                        inputs=[v_tone_search, v_tone_category, v_tone_fav_only],
+                        outputs=[v_tone_preset],
+                    )
+                v_tone_preset.change(
+                    _on_tone_preset_selected,
+                    inputs=[v_tone_preset],
+                    outputs=[v_cap, v_tone_current, v_tone_recent],
+                )
+                v_tone_recent.change(lambda pid: pid, inputs=[v_tone_recent], outputs=[v_tone_preset])
+                v_tone_fav_btn.click(
+                    _on_tone_favorite_toggle, inputs=[v_tone_preset], outputs=[v_tone_fav_status, v_tone_preset],
+                )
+
+                _custom_inputs = [
+                    v_custom_extra, v_custom_emotion, v_custom_brightness, v_custom_pitch,
+                    v_custom_speed, v_custom_volume, v_custom_intonation, v_custom_breath, v_custom_intensity,
+                ]
+                for _comp, _source in [
+                    (v_custom_extra, "extra"), (v_custom_emotion, "emotion"), (v_custom_brightness, "brightness"),
+                    (v_custom_pitch, "pitch"), (v_custom_speed, "speed"), (v_custom_volume, "volume"),
+                    (v_custom_intonation, "intonation"), (v_custom_breath, "breathiness"),
+                    (v_custom_intensity, "intensity"),
+                ]:
+                    _comp.change(
+                        functools.partial(_on_custom_axis_change, _source),
+                        inputs=_custom_inputs,
+                        outputs=[v_cap, v_custom_warn],
+                    )
 
             # ===== 読み辞書 =====
             with gr.Tab("📖 読み辞書"):
@@ -752,7 +941,12 @@ def build_ui():
         v_btn.click(
             generate_vd,
             [m_model, v_text, v_cap, v_ref, v_extra_refs, v_steps, v_cfg_t, v_cfg_c, v_cfg_s, v_seed, v_speed, dict_input, v_save, v_t_schedule, v_sway_coeff],
-            [v_out, v_info],
+            [v_out, v_info, v_warn],
+        )
+        v_preview_btn.click(
+            generate_vd,
+            [m_model, v_text, v_cap, v_ref, v_extra_refs, v_steps, v_cfg_t, v_cfg_c, v_cfg_s, v_seed, v_speed, dict_input, v_save, v_t_schedule, v_sway_coeff],
+            [v_preview_out, v_preview_info, v_warn],
         )
 
         gr.Markdown("---\n📜 コード・モデル: MIT License | [Irodori-TTS](https://github.com/Aratako/Irodori-TTS)")
