@@ -8,14 +8,12 @@ Adapted for local use (no Google Drive)
 
 import argparse
 import functools
-import gc
 import os
 import shutil
 import socket
 import subprocess as sp
 import sys
 from collections import OrderedDict
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -24,14 +22,12 @@ sys.path.insert(0, str(REPO_DIR))
 os.chdir(str(REPO_DIR))
 
 import gradio as gr
-import torch
 from irodori_tts.inference_runtime import (
-    RuntimeKey, SamplingRequest, clear_cached_runtime,
+    RuntimeKey, SamplingRequest,
     default_runtime_device, download_hf_checkpoint, get_cached_runtime, save_wav,
 )
 from irodori_tts.tone_custom import EMOTION_CHOICES, build_custom_caption
 from irodori_tts.tone_library import ToneLibraryStore, search_presets
-# get_preset はモデルプリセット取得用に既存の同名関数があるため別名で取り込む
 from irodori_tts.tone_presets import CATEGORIES, category_label
 from irodori_tts.tone_presets import get_preset as get_tone_preset
 from irodori_tts.tone_request import build_vd_request_kwargs, check_caption_support
@@ -49,72 +45,16 @@ for _d in [OUTPUT_DIR, REF_DIR]:
 CODEC_REPO = "Aratako/Semantic-DACVAE-Japanese-32dim"
 
 # --- モデル定義 ---
-V4_REPO = "Aratako/Irodori-TTS-v4-Small"
-V4_QUANT_REPO = "Aratako/Irodori-TTS-v4-Small-Quantized"
-V3_BASE_REPO = "Aratako/Irodori-TTS-500M-v3"
-V3_VD_REPO = "Aratako/Irodori-TTS-600M-v3-VoiceDesign"
-
-
-@dataclass(frozen=True)
-class ModelPreset:
-    """UIから選べるモデル構成。
-
-    v4-Small はクローンとボイスデザインが1つのチェックポイントに統合されているため、
-    clone_source と design_source は同じになる（タブを切り替えても再ロードが起きない）。
-    v3 は用途ごとにチェックポイントが分かれるため、タブ切替でモデルが載せ替わる。
-    """
-
-    clone_source: str
-    design_source: str
-    precision: str
-    unified: bool  # True = v4系（キャプション＋参照音声の同時利用、複数参照音声に対応）
-    note: str
-
-
-MODEL_PRESETS = OrderedDict([
-    ("v4-Small（統合・推奨）", ModelPreset(
-        clone_source=V4_REPO, design_source=V4_REPO,
-        precision="fp32", unified=True,
-        note=(
-            "**v4-Small（統合モデル / fp32・約3.1GB）** — クローンとボイスデザインが1モデルに統合され、"
-            "参照音声とスタイル説明文を同時に使えます。参照音声は複数クリップを連結して最大120秒まで指定可能。"
-            "<br>※同一話者の短いクリップを合計30秒程度並べるのが最も効果的です。"
-            "参照が短い1クリップだけの場合は v3 のほうが似ることがあります。"
-        ),
-    )),
-    ("v4-Small int8（低VRAM・実験的）", ModelPreset(
-        clone_source=f"{V4_QUANT_REPO}/int8-weight-only",
-        design_source=f"{V4_QUANT_REPO}/int8-weight-only",
-        precision="bf16", unified=True,
-        note=(
-            "**v4-Small INT8 量子化版（約0.9GB / bf16推論）** — VRAMが少ない環境向け。"
-            "初回選択時にダウンロードが走ります。"
-            "<br>※torchao量子化モデルのため、環境によっては動作しない場合があります（実験的）。"
-        ),
-    )),
-    ("v4-Small int4（最小VRAM・実験的）", ModelPreset(
-        clone_source=f"{V4_QUANT_REPO}/int4-weight-only",
-        design_source=f"{V4_QUANT_REPO}/int4-weight-only",
-        precision="bf16", unified=True,
-        note=(
-            "**v4-Small INT4 量子化版（約0.85GB / bf16推論）** — 最もVRAM消費が少ない構成。"
-            "初回選択時にダウンロードが走ります。"
-            "<br>※CUDA tinygemmカーネルを使うため **Compute Capability 8.0以降（RTX 30系以降）のNVIDIA GPUが必須** です（実験的）。"
-        ),
-    )),
-    ("v3（従来・短い参照音声向け）", ModelPreset(
-        clone_source=V3_BASE_REPO, design_source=V3_VD_REPO,
-        precision="fp32", unified=False,
-        note=(
-            "**v3（従来構成）** — クローンは Irodori-TTS-500M-v3、ボイスデザインは 600M-v3-VoiceDesign を使用。"
-            "タブを切り替えるとモデルが載せ替わります（数十秒かかります）。"
-            "<br>※参照音声は1つのみ・最大30秒。短い参照1クリップでのクローンは v4-Small より似る傾向があります。"
-        ),
-    )),
-])
-
-DEFAULT_MODEL = next(iter(MODEL_PRESETS))
-_current_source: "tuple[str, str] | None" = None
+# v4.1-Small 専用。クローンとボイスデザインが1つのチェックポイントに統合されているため、
+# タブを切り替えてもモデルの載せ替えは発生しない。
+MODEL_REPO = "Aratako/Irodori-TTS-v4.1-Small"
+MODEL_PRECISION = "fp32"
+MODEL_NAME = "v4.1-Small"
+MODEL_NOTE = (
+    "**v4.1-Small（統合モデル / fp32・約3.1GB）** — クローンとボイスデザインが1モデルに統合され、"
+    "参照音声とスタイル説明文を同時に使えます。参照音声は複数クリップを連結して最大120秒まで指定可能。"
+    "<br>※同一話者の短いクリップを合計30秒程度並べるのが最も効果的です。"
+)
 
 # ffmpeg の確認
 _FFMPEG_AVAILABLE = sp.run(
@@ -178,40 +118,25 @@ _ALL_CATEGORIES_LABEL = "すべて"
 # ユーティリティ関数
 # ==========================================
 
-def get_preset(model_choice):
-    return MODEL_PRESETS.get(model_choice) or MODEL_PRESETS[DEFAULT_MODEL]
-
-
-def _make_key(ckpt, precision):
+def _make_key(ckpt):
     d = default_runtime_device()
     return RuntimeKey(
         checkpoint=ckpt, model_device=d, codec_repo=CODEC_REPO,
-        model_precision=precision, codec_device=d, codec_precision="fp32",
+        model_precision=MODEL_PRECISION, codec_device=d, codec_precision="fp32",
         compile_model=False, compile_dynamic=False,
     )
 
 
-def _ensure_model(source, precision):
+def _ensure_model():
     """チェックポイントを取得してランタイムを用意する。
 
-    source は "owner/repo" もしくは "owner/repo/subfolder"（量子化版）。
     download_hf_checkpoint は model.safetensors に加えて同梱の tokenizer/ も取得するため、
-    v4-Small では hf_hub_download ではなくこちらを使う必要がある。
+    v4.1-Small では hf_hub_download ではなくこちらを使う必要がある。
     """
-    global _current_source
-    target = (source, precision)
-    if _current_source != target:
-        if _current_source is not None:
-            print(f"[model] {_current_source[0]} → アンロード中...", flush=True)
-            clear_cached_runtime()
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        _current_source = target
-    ckpt = download_hf_checkpoint(source)
-    runtime, reloaded = get_cached_runtime(_make_key(ckpt, precision))
+    ckpt = download_hf_checkpoint(MODEL_REPO)
+    runtime, reloaded = get_cached_runtime(_make_key(ckpt))
     if reloaded:
-        print(f"[model] {source} ({precision}) ロード完了", flush=True)
+        print(f"[model] {MODEL_REPO} ({MODEL_PRECISION}) ロード完了", flush=True)
     return runtime
 
 
@@ -377,19 +302,6 @@ def _on_t_schedule_mode_change(mode: str) -> object:
     return gr.update(interactive=str(mode).strip().lower() == "sway")
 
 
-def _on_model_change(model_choice):
-    """モデル選択に応じて、v4系のみで使える入力欄の表示を切り替える。"""
-    preset = get_preset(model_choice)
-    return (
-        preset.note,
-        gr.update(visible=preset.unified),  # b_extra_refs
-        gr.update(visible=preset.unified),  # b_extra_note
-        gr.update(visible=preset.unified),  # b_cap_group
-        gr.update(visible=preset.unified),  # b_cfg_c
-        gr.update(visible=preset.unified),  # v_extra_refs
-    )
-
-
 def _parse_optional_str(raw: str | None) -> str | None:
     if raw is None:
         return None
@@ -421,7 +333,7 @@ def _coerce_gradio_file_path(value: object) -> "str | None":
 def _resolve_ref_paths(main_audio, extra_files):
     """メイン参照音声＋追加参照音声を、指定順のパスリストにまとめる。
 
-    v4-Small は各クリップを個別にエンコードしてからこの順で連結する。
+    v4.1-Small は各クリップを個別にエンコードしてからこの順で連結する。
     """
     paths = []
     main = _coerce_gradio_file_path(main_audio)
@@ -444,16 +356,14 @@ def _supports_caption(runtime):
 # 音声生成関数
 # ==========================================
 
-def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_embed_file, speaker_embed_path_text, num_steps, cfg_t, cfg_c, cfg_s, seed_raw, speed, dict_text, save_audio, max_seconds, specified_seconds, dur_scale, t_schedule_mode, sway_coeff, lora_adapter_raw):
+def generate_base(text, caption, ref_audio, extra_refs, speaker_embed_file, speaker_embed_path_text, num_steps, cfg_t, cfg_c, cfg_s, seed_raw, speed, dict_text, save_audio, max_seconds, specified_seconds, dur_scale, t_schedule_mode, sway_coeff, lora_adapter_raw):
     if not text or not text.strip():
         raise gr.Error("テキストを入力してください")
     original = text.strip()
     processed = apply_dict(original, dict_text)
-    preset = get_preset(model_choice)
-    runtime = _ensure_model(preset.clone_source, preset.precision)
-    # 追加参照音声とキャプションはv4系のみ。v3選択時はUIを隠すが、値は送られてくるので明示的に無視する。
-    refs = _resolve_ref_paths(ref_audio, extra_refs if preset.unified else None)
-    cap = caption.strip() if preset.unified and caption and caption.strip() else None
+    runtime = _ensure_model()
+    refs = _resolve_ref_paths(ref_audio, extra_refs)
+    cap = caption.strip() if caption and caption.strip() else None
     if cap is not None and not _supports_caption(runtime):
         cap = None
     speaker_embed = _coerce_gradio_file_path(speaker_embed_file)
@@ -482,7 +392,7 @@ def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_em
         ref_normalize_db=-16.0, ref_ensure_max=True,
         num_candidates=1, decode_mode="sequential",
         seconds=seconds, duration_scale=float(dur_scale),
-        # None = チェックポイントの推奨値（v4-Small: 120秒 / v3以前: 30秒）
+        # None = チェックポイントの推奨値（v4.1-Small: 120秒）
         max_ref_seconds=None, max_text_len=None, max_caption_len=None,
         max_seconds=effective_max_seconds,
         num_steps=int(num_steps), seed=seed,
@@ -510,7 +420,7 @@ def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_em
     if cap:
         mode += "/説明文あり"
     save_loc = "📁ローカル保存" if save_audio else "🗑️保存なし(一時表示)"
-    info = f"🎤 {model_choice}({mode}) | Seed: {result.used_seed} | 生成: {result.total_to_decode:.1f}秒 | {save_loc}"
+    info = f"🎤 {MODEL_NAME}({mode}) | Seed: {result.used_seed} | 生成: {result.total_to_decode:.1f}秒 | {save_loc}"
     if seconds is not None:
         info += f" | 指定長さ: {seconds:.1f}秒"
     elif abs(float(dur_scale) - 1.0) >= 0.01:
@@ -522,15 +432,13 @@ def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_em
     return path, info
 
 
-def generate_vd(model_choice, text, caption, ref_audio, extra_refs, num_steps, cfg_t, cfg_c, cfg_s, seed_raw, speed, dict_text, save_audio, t_schedule_mode, sway_coeff):
+def generate_vd(text, caption, ref_audio, extra_refs, num_steps, cfg_t, cfg_c, cfg_s, seed_raw, speed, dict_text, save_audio, t_schedule_mode, sway_coeff):
     if not text or not text.strip():
         raise gr.Error("テキストを入力してください")
     original = text.strip()
     processed = apply_dict(original, dict_text)
-    preset = get_preset(model_choice)
-    runtime = _ensure_model(preset.design_source, preset.precision)
-    # 追加参照音声はv4系のみ。v3選択時はUIを隠すが、値は送られてくるので明示的に無視する。
-    refs = _resolve_ref_paths(ref_audio, extra_refs if preset.unified else None)
+    runtime = _ensure_model()
+    refs = _resolve_ref_paths(ref_audio, extra_refs)
     seed = None
     if seed_raw and seed_raw.strip():
         try:
@@ -570,7 +478,7 @@ def generate_vd(model_choice, text, caption, ref_audio, extra_refs, num_steps, c
     else:
         speaker_mode = "参照あり"
     save_loc = "📁ローカル保存" if save_audio else "🗑️保存なし(一時表示)"
-    info = f"🎨 {model_choice}({ci}/{speaker_mode}) | Seed: {result.used_seed} | 生成: {result.total_to_decode:.1f}秒 | {save_loc}"
+    info = f"🎨 {MODEL_NAME}({ci}/{speaker_mode}) | Seed: {result.used_seed} | 生成: {result.total_to_decode:.1f}秒 | {save_loc}"
     if abs(speed - 1.0) >= 0.01:
         info += f" | 話速: {speed:.1f}x" + ("" if _FFMPEG_AVAILABLE else " (ffmpeg未検出のため無効)")
     if original != processed:
@@ -670,11 +578,7 @@ def build_ui():
             f"{ffmpeg_status} / 📖 辞書 / 📝 プリセット / 📁 ローカル保存モード"
         )
 
-        m_model = gr.Radio(
-            choices=list(MODEL_PRESETS.keys()), value=DEFAULT_MODEL,
-            label="🧠 使用モデル",
-        )
-        m_model_note = gr.Markdown(MODEL_PRESETS[DEFAULT_MODEL].note)
+        gr.Markdown(MODEL_NOTE)
 
         with gr.Tabs():
             # ===== ボイスクローン =====
@@ -711,12 +615,10 @@ def build_ui():
                                     label="➕ 追加の参照音声（任意・複数可／上の参照音声の後ろに並べた順で連結）",
                                     type="filepath", file_count="multiple",
                                     file_types=["audio"], allow_reordering=True,
-                                    visible=MODEL_PRESETS[DEFAULT_MODEL].unified,
                                 )
-                                b_extra_note = gr.Markdown(
+                                gr.Markdown(
                                     "💡 同じ話者のノイズの少ない短いクリップを複数並べると似やすくなります"
                                     "（合計30秒程度が目安・最大120秒）。長い録音1本でも動きますが効果は未検証です。",
-                                    visible=MODEL_PRESETS[DEFAULT_MODEL].unified,
                                 )
                             with gr.Tab("🧬 スピーカー埋め込み"):
                                 with gr.Row():
@@ -728,11 +630,11 @@ def build_ui():
                                         label="埋め込みパス (.speaker.safetensors, 任意)",
                                         value="", scale=1,
                                     )
-                        with gr.Group(visible=MODEL_PRESETS[DEFAULT_MODEL].unified) as b_cap_group:
+                        with gr.Group():
                             b_cap_preset = gr.Dropdown(
                                 choices=list(CAPTION_PRESETS.keys()),
                                 value="（プリセットを選択）",
-                                label="📝 説明文プリセット（v4-Small は参照音声と説明文を併用できます）",
+                                label="📝 説明文プリセット（v4.1-Small は参照音声と説明文を併用できます）",
                             )
                             b_cap = gr.Textbox(
                                 label="🎨 話し方・感情の説明文（任意）", lines=2,
@@ -749,7 +651,6 @@ def build_ui():
                         b_cfg_t = gr.Slider(0.0, 10.0, 3.0, step=0.1, label="テキストと感情表現の効き具合 標準=3")
                         b_cfg_c = gr.Slider(
                             0.0, 10.0, 4.0, step=0.1, label="説明文の効き具合 標準=4",
-                            visible=MODEL_PRESETS[DEFAULT_MODEL].unified,
                         )
                         b_save = gr.Checkbox(label="💾 生成音声をフォルダに自動保存する", value=True)
                         with gr.Accordion("⚙️ パラメータ", open=False):
@@ -811,7 +712,6 @@ def build_ui():
                             label="➕ 追加の参照音声（任意・複数可／上の参照音声の後ろに並べた順で連結）",
                             type="filepath", file_count="multiple",
                             file_types=["audio"], allow_reordering=True,
-                            visible=MODEL_PRESETS[DEFAULT_MODEL].unified,
                         )
 
                         v_tone_mode = gr.Radio(
@@ -965,24 +865,20 @@ def build_ui():
         v_t_schedule.change(
             _on_t_schedule_mode_change, inputs=[v_t_schedule], outputs=[v_sway_coeff]
         )
-        m_model.change(
-            _on_model_change, inputs=[m_model],
-            outputs=[m_model_note, b_extra_refs, b_extra_note, b_cap_group, b_cfg_c, v_extra_refs],
-        )
 
         b_btn.click(
             generate_base,
-            [m_model, b_text, b_cap, b_ref, b_extra_refs, b_speaker_embed_file, b_speaker_embed_path, b_steps, b_cfg_t, b_cfg_c, b_cfg_s, b_seed, b_speed, dict_input, b_save, b_max_seconds, b_seconds, b_dur_scale, b_t_schedule, b_sway_coeff, b_lora_adapter],
+            [b_text, b_cap, b_ref, b_extra_refs, b_speaker_embed_file, b_speaker_embed_path, b_steps, b_cfg_t, b_cfg_c, b_cfg_s, b_seed, b_speed, dict_input, b_save, b_max_seconds, b_seconds, b_dur_scale, b_t_schedule, b_sway_coeff, b_lora_adapter],
             [b_out, b_info],
         )
         v_btn.click(
             generate_vd,
-            [m_model, v_text, v_cap, v_ref, v_extra_refs, v_steps, v_cfg_t, v_cfg_c, v_cfg_s, v_seed, v_speed, dict_input, v_save, v_t_schedule, v_sway_coeff],
+            [v_text, v_cap, v_ref, v_extra_refs, v_steps, v_cfg_t, v_cfg_c, v_cfg_s, v_seed, v_speed, dict_input, v_save, v_t_schedule, v_sway_coeff],
             [v_out, v_info, v_warn],
         )
         v_preview_btn.click(
             generate_vd,
-            [m_model, v_text, v_cap, v_ref, v_extra_refs, v_steps, v_cfg_t, v_cfg_c, v_cfg_s, v_seed, v_speed, dict_input, v_save, v_t_schedule, v_sway_coeff],
+            [v_text, v_cap, v_ref, v_extra_refs, v_steps, v_cfg_t, v_cfg_c, v_cfg_s, v_seed, v_speed, dict_input, v_save, v_t_schedule, v_sway_coeff],
             [v_preview_out, v_preview_info, v_warn],
         )
 
@@ -1007,7 +903,7 @@ def main():
 
     print("=" * 60)
     print("🎙️ Irodori-TTS ゆうぷろカスタム V2.0.0 [ローカル版]")
-    print(f"   🧠 既定モデル : {DEFAULT_MODEL}")
+    print(f"   🧠 使用モデル : {MODEL_NAME}")
     print(f"   📁 出力先     : {OUTPUT_DIR}")
     print(f"   🎤 参照音声   : {REF_DIR}")
     print(f"   📖 辞書       : {DICT_FILE}")
