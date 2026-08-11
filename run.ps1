@@ -134,44 +134,27 @@ $pyScript = Join-Path $env:TEMP 'irodori_dl.py'
 @'
 from huggingface_hub import snapshot_download, try_to_load_from_cache
 
-# v4-Small は model.safetensors に加えて同梱の tokenizer/ も必要なため、
+# v4.1-Small は model.safetensors に加えて同梱の tokenizer/ も必要なため、
 # ファイル単体ではなく snapshot_download で取得する（irodori_tts 側と同じ取得方法）。
 ALLOW_PATTERNS = ["model.safetensors", "tokenizer/*"]
 
-MODELS = [
-    ("v4-Small 統合モデル", "Aratako/Irodori-TTS-v4-Small",
-     ["model.safetensors", "tokenizer/tokenizer_config.json"]),
-    ("v3 ベースモデル",     "Aratako/Irodori-TTS-500M-v3",
-     ["model.safetensors"]),
-    ("v3 VoiceDesign",     "Aratako/Irodori-TTS-600M-v3-VoiceDesign",
-     ["model.safetensors"]),
-]
+LABEL = "v4.1-Small 統合モデル"
+REPO_ID = "Aratako/Irodori-TTS-v4.1-Small"
+REQUIRED = ["model.safetensors", "tokenizer/tokenizer_config.json"]
 
-missing = []
-for label, repo_id, required in MODELS:
-    cached = all(
-        isinstance(try_to_load_from_cache(repo_id=repo_id, filename=name), str)
-        for name in required
-    )
-    if cached:
-        print(f"  [OK]   {label} ({repo_id}) は取得済み")
-    else:
-        print(f"  [MISS] {label} ({repo_id}) は未取得")
-        missing.append((label, repo_id))
+cached = all(
+    isinstance(try_to_load_from_cache(repo_id=REPO_ID, filename=name), str)
+    for name in REQUIRED
+)
 
-if not missing:
-    print("  すべてのモデルが取得済みです。")
+if cached:
+    print(f"  [OK]   {LABEL} ({REPO_ID}) は取得済み")
 else:
+    print(f"  [MISS] {LABEL} ({REPO_ID}) は未取得")
     print("")
-    print(f"  未取得のモデルをダウンロードします ({len(missing)}件)... 数分〜十数分かかります")
-    for i, (label, repo_id) in enumerate(missing, 1):
-        print(f"  [{i}/{len(missing)}] {label} ({repo_id})...")
-        p = snapshot_download(repo_id=repo_id, allow_patterns=ALLOW_PATTERNS)
-        print(f"          完了: {p}")
-    print("  ダウンロード完了！")
-
-print("")
-print("  ※ 量子化版 (v4-Small int8 / int4) は、UIで選択したときに自動ダウンロードされます。")
+    print("  ダウンロードします... 数分〜十数分かかります")
+    p = snapshot_download(repo_id=REPO_ID, allow_patterns=ALLOW_PATTERNS)
+    print(f"          完了: {p}")
 '@ | Set-Content $pyScript -Encoding UTF8
 uv run --no-sync python $pyScript
 Remove-Item $pyScript -Force -ErrorAction SilentlyContinue
