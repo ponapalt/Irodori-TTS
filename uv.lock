@@ -1968,7 +1968,7 @@ requires-dist = [
     { name = "dacvae", git = "https://github.com/facebookresearch/dacvae" },
     { name = "datasets", specifier = ">=3.0.0" },
     { name = "gradio", specifier = ">=5.0.0" },
-    { name = "huggingface-hub", specifier = ">=0.34.0" },
+    { name = "huggingface-hub", specifier = ">=1.0" },
     { name = "llvmlite", specifier = ">=0.40.0" },
     { name = "numba", specifier = ">=0.57.0" },
     { name = "peft", specifier = ">=0.18.0" },
