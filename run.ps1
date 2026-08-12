@@ -7,6 +7,14 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 
 $RepoDir = $PSScriptRoot
 
+# Hugging Face キャッシュのシンボリックリンクを無効化する。
+# HF のキャッシュは snapshots/<rev>/<file> を blobs/ へのシンボリックリンクにするが、
+# Windows でのリンク作成には SeCreateSymbolicLinkPrivilege（管理者 or 開発者モード）が必要。
+# 特権が無い環境では WinError 1314 が発生し、huggingface_hub 側のフォールバックでも
+# 捕捉されずダウンロードが中断するため、リンクを使わない動作に固定する。
+# ※ Python 起動前（import 前）に設定する必要がある。
+$env:HF_HUB_DISABLE_SYMLINKS = "1"
+
 Write-Host ""
 Write-Host "============================================================"
 Write-Host "  Irodori-TTS ゆうぷろカスタム V2.0.0 [ローカル版]"
