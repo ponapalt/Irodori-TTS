@@ -137,32 +137,47 @@ Write-Host ""
 Write-Host "============================================================"
 Write-Host "  モデルキャッシュを確認中"
 Write-Host "============================================================"
+Write-Host "  ※ 初回は2モデル合計で約6.2GB をダウンロードします"
 
 $pyScript = Join-Path $env:TEMP 'irodori_dl.py'
 @'
 from huggingface_hub import snapshot_download, try_to_load_from_cache
 
-# v4.1-Small は model.safetensors に加えて同梱の tokenizer/ も必要なため、
+# v4.1 系は model.safetensors に加えて同梱の tokenizer/ も必要なため、
 # ファイル単体ではなく snapshot_download で取得する（irodori_tts 側と同じ取得方法）。
+# リポジトリには量子化版のサブフォルダも含まれるが、ALLOW_PATTERNS が
+# ルート直下の model.safetensors にしかマッチしないので自動的に除外される。
 ALLOW_PATTERNS = ["model.safetensors", "tokenizer/*"]
-
-LABEL = "v4.1-Small 統合モデル"
-REPO_ID = "Aratako/Irodori-TTS-v4.1-Small"
 REQUIRED = ["model.safetensors", "tokenizer/tokenizer_config.json"]
 
-cached = all(
-    isinstance(try_to_load_from_cache(repo_id=REPO_ID, filename=name), str)
-    for name in REQUIRED
-)
+# UI のモデル選択（gradio_app_yuupro.py の MODEL_PRESETS）と対応させること。
+MODELS = [
+    ("v4.1-Small 統合モデル",     "Aratako/Irodori-TTS-v4.1-Small"),
+    ("v4.1-Anime アニメ声モデル", "phasefield-audio/Irodori-TTS-v4.1-Anime"),
+]
 
-if cached:
-    print(f"  [OK]   {LABEL} ({REPO_ID}) は取得済み")
+missing = []
+for label, repo_id in MODELS:
+    cached = all(
+        isinstance(try_to_load_from_cache(repo_id=repo_id, filename=name), str)
+        for name in REQUIRED
+    )
+    if cached:
+        print(f"  [OK]   {label} ({repo_id}) は取得済み")
+    else:
+        print(f"  [MISS] {label} ({repo_id}) は未取得")
+        missing.append((label, repo_id))
+
+if not missing:
+    print("  すべてのモデルが取得済みです。")
 else:
-    print(f"  [MISS] {LABEL} ({REPO_ID}) は未取得")
     print("")
-    print("  ダウンロードします... 数分〜十数分かかります")
-    p = snapshot_download(repo_id=REPO_ID, allow_patterns=ALLOW_PATTERNS)
-    print(f"          完了: {p}")
+    print(f"  未取得のモデルをダウンロードします ({len(missing)}件 / 各約3.1GB)... 数分〜十数分かかります")
+    for i, (label, repo_id) in enumerate(missing, 1):
+        print(f"  [{i}/{len(missing)}] {label} ({repo_id})...")
+        p = snapshot_download(repo_id=repo_id, allow_patterns=ALLOW_PATTERNS)
+        print(f"          完了: {p}")
+    print("  ダウンロード完了！")
 '@ | Set-Content $pyScript -Encoding UTF8
 uv run --no-sync python $pyScript
 Remove-Item $pyScript -Force -ErrorAction SilentlyContinue
