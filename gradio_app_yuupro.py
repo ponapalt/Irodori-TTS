@@ -23,6 +23,7 @@ sys.path.insert(0, str(REPO_DIR))
 os.chdir(str(REPO_DIR))
 
 import gradio as gr
+from huggingface_hub import try_to_load_from_cache
 from irodori_tts.inference_runtime import (
     RuntimeKey, SamplingRequest,
     clear_cached_runtime, default_runtime_device, download_hf_checkpoint,
@@ -47,16 +48,22 @@ for _d in [OUTPUT_DIR, REF_DIR]:
 CODEC_REPO = "Aratako/Semantic-DACVAE-Japanese-32dim"
 
 # --- モデル定義 ---
-# どちらも v4.1 系の統合チェックポイント（クローンとボイスデザインが1モデルに統合）なので、
+# いずれも v4.1 系の統合チェックポイント（クローンとボイスデザインが1モデルに統合）なので、
 # タブを切り替えてもモデルの載せ替えは発生しない。精度・codec も共通のため、
-# プリセットが持つ差分は repo id と説明文だけでよい。
+# プリセットが持つ差分は repo id・説明文・MeanFlow モデルかどうかだけでよい。
 MODEL_PRECISION = "fp32"
+
+# MeanFlow モデルは蒸留時に CFG を焼き込んでおり、ランタイム側の CFG / Time Schedule / Sway は
+# 無視される（InferenceRuntime.synthesize 参照）。UI でもそれらを無効化し、ステップ数の標準値を切り替える。
+RF_DEFAULT_STEPS = 40
+MEANFLOW_DEFAULT_STEPS = 4
 
 
 @dataclass(frozen=True)
 class ModelPreset:
     repo: str  # Hugging Face repo id
     note: str  # UI に表示する説明文（Markdown）
+    meanflow: bool = False  # MeanFlow 蒸留モデルか（UI のパラメータ切替にのみ使う）
 
 
 MODEL_PRESETS = OrderedDict([
@@ -77,16 +84,48 @@ MODEL_PRESETS = OrderedDict([
             "効き方が標準モデルと異なる場合があります。"
         ),
     )),
+    ("v4.1-Small-MF（高速 / MeanFlow）", ModelPreset(
+        repo="Aratako/Irodori-TTS-v4.1-Small-MF",
+        note=(
+            "**v4.1-Small-MF（MeanFlow蒸留 / fp32・約3.1GB）** — v4.1-Small を MeanFlow 蒸留し、"
+            "少ないステップ数（標準4）で生成できるようにした高速版。参照音声・説明文・長さ指定・Seed は"
+            "v4.1-Small と同じように使えます。"
+            "<br>※効き具合（CFG）スライダー・Time Schedule・Sway Coeff は蒸留時に固定されているため無効になります。"
+        ),
+        meanflow=True,
+    )),
 ])
 
 DEFAULT_MODEL = next(iter(MODEL_PRESETS))
 
 # 現在ランタイムに載っている repo id。切替検知に使う（None = 未ロード）。
-_current_repo: "str | None" = None
+_loaded_repo: "str | None" = None
 
 
 def get_preset(model_choice):
     return MODEL_PRESETS.get(model_choice) or MODEL_PRESETS[DEFAULT_MODEL]
+
+
+# MeanFlow 切替でラベルを差し替えるパラメータの元ラベル
+CFG_TEXT_LABEL = "テキストと感情表現の効き具合 標準=3"
+BASE_CFG_CAPTION_LABEL = "説明文の効き具合 標準=4"
+VD_CFG_CAPTION_LABEL = "音声スタイルの効き具合 標準=4"
+CFG_SPEAKER_LABEL = "CFG Speaker"
+T_SCHEDULE_LABEL = "Time Schedule"
+SWAY_COEFF_LABEL = "Sway Coeff"
+
+
+def _default_steps(meanflow):
+    return MEANFLOW_DEFAULT_STEPS if meanflow else RF_DEFAULT_STEPS
+
+
+def _steps_label(meanflow):
+    return f"Num Steps（標準={_default_steps(meanflow)}）"
+
+
+def _rf_only_label(base, meanflow):
+    """MeanFlow モデルでは効かないパラメータのラベル。"""
+    return f"{base}（MeanFlowモデルでは無効）" if meanflow else base
 
 
 # ffmpeg の確認
@@ -160,7 +199,26 @@ def _make_key(ckpt):
     )
 
 
-def _ensure_model(model_choice):
+# 生成ボタン押下後の待ち時間の内訳。出力欄のステータスに「n/3 工程」と説明文で表示する。
+# Gradio の StatusTracker は割合（index/length か progress）が無いと説明文を描画しないため、
+# 工程番号を渡している。
+_STAGE_DOWNLOAD, _STAGE_LOAD, _STAGE_GENERATE = range(3)
+_STAGE_COUNT = 3
+
+
+def _report_stage(progress, stage, desc):
+    progress((stage, _STAGE_COUNT), desc=desc, unit=" 工程")
+
+
+def _is_hf_file_cached(repo_id, filename):
+    """HF キャッシュにファイルがあるか（通信なし）。待機理由の表示の出し分けにだけ使う。"""
+    try:
+        return isinstance(try_to_load_from_cache(repo_id=repo_id, filename=filename), str)
+    except Exception:
+        return False
+
+
+def _ensure_model(model_choice, progress):
     """選択されたモデルのチェックポイントを取得してランタイムを用意する。
 
     download_hf_checkpoint は model.safetensors に加えて同梱の tokenizer/ も取得するため、
@@ -169,26 +227,71 @@ def _ensure_model(model_choice):
     get_cached_runtime は新しいランタイムを構築してから古い方をアンロードするため、
     そのままだと切替の瞬間に約3.1GBのモデルが二重に載る。先に clear_cached_runtime() で
     解放してから読み込む。
+
+    初回のダウンロード（codec はランタイム構築時に取得される）や読み込みは数十秒〜十数分
+    かかるため、その間に何を待っているのかをトーストと出力欄のステータスで知らせる。
     """
-    global _current_repo
+    global _loaded_repo
     preset = get_preset(model_choice)
-    if _current_repo is not None and _current_repo != preset.repo:
-        print(f"[model] {_current_repo} → アンロード中...", flush=True)
-        clear_cached_runtime()
-    _current_repo = preset.repo
+    codec_cached = _is_hf_file_cached(CODEC_REPO, "weights.pth")
+
+    if not _is_hf_file_cached(preset.repo, "model.safetensors"):
+        gr.Info(
+            f"初回のみ「{model_choice}」のダウンロードが必要です。"
+            "回線速度によっては数分〜十数分かかります（進捗はコンソールに表示されます）。",
+            duration=30,
+        )
+        _report_stage(progress, _STAGE_DOWNLOAD, "⏬ モデルをダウンロード中…（初回のみ）")
+        print(f"[model] {preset.repo} ダウンロード中...", flush=True)
     ckpt = download_hf_checkpoint(preset.repo)
+
+    if _loaded_repo != preset.repo:
+        if _loaded_repo is not None:
+            print(f"[model] {_loaded_repo} → アンロード中...", flush=True)
+            clear_cached_runtime()
+            _loaded_repo = None
+        desc = "📦 モデルを読み込み中…"
+        if not codec_cached:
+            desc += "（初回は音声コーデックのダウンロードを含む）"
+        _report_stage(progress, _STAGE_LOAD, desc)
     runtime, reloaded = get_cached_runtime(_make_key(ckpt))
+    _loaded_repo = preset.repo
     if reloaded:
         print(f"[model] {preset.repo} ({MODEL_PRECISION}) ロード完了", flush=True)
     return runtime
 
 
-def _on_model_change(model_choice):
-    """モデル選択に応じて説明文を差し替える。
+def _on_model_change(model_choice, prev_meanflow, b_t_schedule, v_t_schedule):
+    """モデル選択に応じて説明文と、MeanFlow モデルで効かないパラメータの有効/無効を切り替える。
 
-    実際のロードは生成時（_ensure_model）まで遅延させる。
+    実際のロードは生成時（_ensure_model）まで遅延させる。ステップ数は RF ⇔ MeanFlow を
+    跨いだときだけ標準値に戻す（同系統内の切替ではユーザーの設定を保つ）。
     """
-    return get_preset(model_choice).note
+    preset = get_preset(model_choice)
+    mf = preset.meanflow
+
+    def steps():
+        if mf != prev_meanflow:
+            return gr.update(label=_steps_label(mf), value=_default_steps(mf))
+        return gr.update(label=_steps_label(mf))
+
+    def rf_only(base):
+        return gr.update(label=_rf_only_label(base, mf), interactive=not mf)
+
+    def sway(t_schedule):
+        return gr.update(
+            label=_rf_only_label(SWAY_COEFF_LABEL, mf),
+            interactive=not mf and str(t_schedule).strip().lower() == "sway",
+        )
+
+    return (
+        preset.note, mf,
+        steps(), steps(),
+        rf_only(CFG_TEXT_LABEL), rf_only(BASE_CFG_CAPTION_LABEL), rf_only(CFG_SPEAKER_LABEL),
+        rf_only(CFG_TEXT_LABEL), rf_only(VD_CFG_CAPTION_LABEL), rf_only(CFG_SPEAKER_LABEL),
+        rf_only(T_SCHEDULE_LABEL), rf_only(T_SCHEDULE_LABEL),
+        sway(b_t_schedule), sway(v_t_schedule),
+    )
 
 
 def _save(result, prefix, do_save=True):
@@ -403,16 +506,23 @@ def _supports_caption(runtime):
     return bool(getattr(runtime.model_cfg, "use_caption_condition", False))
 
 
+def _meanflow_info(runtime, num_steps):
+    """生成情報に付ける MeanFlow の注記。サンプラーはチェックポイントのメタデータで決まる。"""
+    if runtime.model_cfg.flow_parameterization != "meanflow":
+        return ""
+    return f" | MeanFlow {int(num_steps)}ステップ"
+
+
 # ==========================================
 # 音声生成関数
 # ==========================================
 
-def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_embed_file, speaker_embed_path_text, num_steps, cfg_t, cfg_c, cfg_s, seed_raw, speed, dict_text, save_audio, max_seconds, specified_seconds, dur_scale, t_schedule_mode, sway_coeff, lora_adapter_raw):
+def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_embed_file, speaker_embed_path_text, num_steps, cfg_t, cfg_c, cfg_s, seed_raw, speed, dict_text, save_audio, max_seconds, specified_seconds, dur_scale, t_schedule_mode, sway_coeff, lora_adapter_raw, progress=gr.Progress()):
     if not text or not text.strip():
         raise gr.Error("テキストを入力してください")
     original = text.strip()
     processed = apply_dict(original, dict_text)
-    runtime = _ensure_model(model_choice)
+    runtime = _ensure_model(model_choice, progress)
     refs = _resolve_ref_paths(ref_audio, extra_refs)
     cap = caption.strip() if caption and caption.strip() else None
     if cap is not None and not _supports_caption(runtime):
@@ -436,6 +546,7 @@ def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_em
     if seconds is not None and seconds > effective_max_seconds:
         effective_max_seconds = seconds
     lora_adapter = _parse_optional_str(lora_adapter_raw)
+    _report_stage(progress, _STAGE_GENERATE, "🎵 音声を生成中…")
     result = runtime.synthesize(SamplingRequest(
         text=processed, caption=cap,
         ref_wav=None, ref_wavs=refs or None,
@@ -472,6 +583,7 @@ def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_em
         mode += "/説明文あり"
     save_loc = "📁ローカル保存" if save_audio else "🗑️保存なし(一時表示)"
     info = f"🎤 {model_choice}({mode}) | Seed: {result.used_seed} | 生成: {result.total_to_decode:.1f}秒 | {save_loc}"
+    info += _meanflow_info(runtime, num_steps)
     if seconds is not None:
         info += f" | 指定長さ: {seconds:.1f}秒"
     elif abs(float(dur_scale) - 1.0) >= 0.01:
@@ -483,12 +595,12 @@ def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_em
     return path, info
 
 
-def generate_vd(model_choice, text, caption, ref_audio, extra_refs, num_steps, cfg_t, cfg_c, cfg_s, seed_raw, speed, dict_text, save_audio, t_schedule_mode, sway_coeff):
+def generate_vd(model_choice, text, caption, ref_audio, extra_refs, num_steps, cfg_t, cfg_c, cfg_s, seed_raw, speed, dict_text, save_audio, t_schedule_mode, sway_coeff, progress=gr.Progress()):
     if not text or not text.strip():
         raise gr.Error("テキストを入力してください")
     original = text.strip()
     processed = apply_dict(original, dict_text)
-    runtime = _ensure_model(model_choice)
+    runtime = _ensure_model(model_choice, progress)
     refs = _resolve_ref_paths(ref_audio, extra_refs)
     seed = None
     if seed_raw and seed_raw.strip():
@@ -518,6 +630,7 @@ def generate_vd(model_choice, text, caption, ref_audio, extra_refs, num_steps, c
         print(f"[warning] {caption_warning}", flush=True)
         gr.Warning(caption_warning)
 
+    _report_stage(progress, _STAGE_GENERATE, "🎵 音声を生成中…")
     result = runtime.synthesize(SamplingRequest(**kwargs), log_fn=lambda m: print(m, flush=True))
     path = apply_speed(_save(result, "vd", save_audio), speed)
     used_refs = kwargs["ref_wavs"] or []
@@ -530,6 +643,7 @@ def generate_vd(model_choice, text, caption, ref_audio, extra_refs, num_steps, c
         speaker_mode = "参照あり"
     save_loc = "📁ローカル保存" if save_audio else "🗑️保存なし(一時表示)"
     info = f"🎨 {model_choice}({ci}/{speaker_mode}) | Seed: {result.used_seed} | 生成: {result.total_to_decode:.1f}秒 | {save_loc}"
+    info += _meanflow_info(runtime, num_steps)
     if abs(speed - 1.0) >= 0.01:
         info += f" | 話速: {speed:.1f}x" + ("" if _FFMPEG_AVAILABLE else " (ffmpeg未検出のため無効)")
     if original != processed:
@@ -635,6 +749,9 @@ def build_ui():
                 label="🧠 使用モデル", scale=1,
             )
         m_model_note = gr.Markdown(MODEL_PRESETS[DEFAULT_MODEL].note)
+        default_mf = MODEL_PRESETS[DEFAULT_MODEL].meanflow
+        # 直前に選ばれていたモデルが MeanFlow か（RF ⇔ MeanFlow を跨いだかの判定用）
+        m_is_meanflow = gr.State(default_mf)
 
         with gr.Tabs():
             # ===== ボイスクローン =====
@@ -704,15 +821,24 @@ def build_ui():
                             0.5, 2.0, 1.0, step=0.1,
                             label=f"🎚️ 話速{speed_label_suffix}",
                         )
-                        b_cfg_t = gr.Slider(0.0, 10.0, 3.0, step=0.1, label="テキストと感情表現の効き具合 標準=3")
+                        b_cfg_t = gr.Slider(
+                            0.0, 10.0, 3.0, step=0.1,
+                            label=_rf_only_label(CFG_TEXT_LABEL, default_mf), interactive=not default_mf,
+                        )
                         b_cfg_c = gr.Slider(
-                            0.0, 10.0, 4.0, step=0.1, label="説明文の効き具合 標準=4",
+                            0.0, 10.0, 4.0, step=0.1,
+                            label=_rf_only_label(BASE_CFG_CAPTION_LABEL, default_mf), interactive=not default_mf,
                         )
                         b_save = gr.Checkbox(label="💾 生成音声をフォルダに自動保存する", value=True)
                         with gr.Accordion("⚙️ パラメータ", open=False):
                             with gr.Row():
-                                b_steps = gr.Slider(1, 120, 40, step=1, label="Num Steps")
-                                b_cfg_s = gr.Slider(0.0, 10.0, 5.0, step=0.1, label="CFG Speaker")
+                                b_steps = gr.Slider(
+                                    1, 120, _default_steps(default_mf), step=1, label=_steps_label(default_mf),
+                                )
+                                b_cfg_s = gr.Slider(
+                                    0.0, 10.0, 5.0, step=0.1,
+                                    label=_rf_only_label(CFG_SPEAKER_LABEL, default_mf), interactive=not default_mf,
+                                )
                             b_max_seconds = gr.Slider(
                                 5, 120, 30, step=5,
                                 label="⏱️ 最大生成時間 (秒) ※30秒超はトレーニング範囲外のため品質が低下する場合があります",
@@ -728,12 +854,13 @@ def build_ui():
                             b_seed = gr.Textbox(label="Seed（空欄=ランダム）", value="")
                             with gr.Row():
                                 b_t_schedule = gr.Dropdown(
-                                    label="Time Schedule",
+                                    label=_rf_only_label(T_SCHEDULE_LABEL, default_mf),
                                     choices=["linear", "sway"],
                                     value="linear",
+                                    interactive=not default_mf,
                                 )
                                 b_sway_coeff = gr.Slider(
-                                    label="Sway Coeff",
+                                    label=_rf_only_label(SWAY_COEFF_LABEL, default_mf),
                                     minimum=-1.0, maximum=1.5, value=-1.0, step=0.1,
                                     interactive=False,
                                 )
@@ -839,22 +966,34 @@ def build_ui():
                             0.5, 2.0, 1.0, step=0.1,
                             label=f"🎚️ 話速{speed_label_suffix}",
                         )
-                        v_cfg_t = gr.Slider(0.0, 10.0, 3.0, step=0.1, label="テキストと感情表現の効き具合 標準=3")
-                        v_cfg_c = gr.Slider(0.0, 10.0, 4.0, step=0.1, label="音声スタイルの効き具合 標準=4")
+                        v_cfg_t = gr.Slider(
+                            0.0, 10.0, 3.0, step=0.1,
+                            label=_rf_only_label(CFG_TEXT_LABEL, default_mf), interactive=not default_mf,
+                        )
+                        v_cfg_c = gr.Slider(
+                            0.0, 10.0, 4.0, step=0.1,
+                            label=_rf_only_label(VD_CFG_CAPTION_LABEL, default_mf), interactive=not default_mf,
+                        )
                         v_save = gr.Checkbox(label="💾 生成音声をフォルダに自動保存する", value=True)
                         with gr.Accordion("⚙️ パラメータ", open=False):
                             with gr.Row():
-                                v_steps = gr.Slider(1, 120, 40, step=1, label="Num Steps")
-                                v_cfg_s = gr.Slider(0.0, 10.0, 5.0, step=0.1, label="CFG Speaker")
+                                v_steps = gr.Slider(
+                                    1, 120, _default_steps(default_mf), step=1, label=_steps_label(default_mf),
+                                )
+                                v_cfg_s = gr.Slider(
+                                    0.0, 10.0, 5.0, step=0.1,
+                                    label=_rf_only_label(CFG_SPEAKER_LABEL, default_mf), interactive=not default_mf,
+                                )
                             v_seed = gr.Textbox(label="Seed（空欄=ランダム）", value="")
                             with gr.Row():
                                 v_t_schedule = gr.Dropdown(
-                                    label="Time Schedule",
+                                    label=_rf_only_label(T_SCHEDULE_LABEL, default_mf),
                                     choices=["linear", "sway"],
                                     value="linear",
+                                    interactive=not default_mf,
                                 )
                                 v_sway_coeff = gr.Slider(
-                                    label="Sway Coeff",
+                                    label=_rf_only_label(SWAY_COEFF_LABEL, default_mf),
                                     minimum=-1.0, maximum=1.5, value=-1.0, step=0.1,
                                     interactive=False,
                                 )
@@ -923,7 +1062,13 @@ def build_ui():
         )
 
         m_model.change(
-            _on_model_change, inputs=[m_model], outputs=[m_model_note]
+            _on_model_change,
+            inputs=[m_model, m_is_meanflow, b_t_schedule, v_t_schedule],
+            outputs=[
+                m_model_note, m_is_meanflow, b_steps, v_steps,
+                b_cfg_t, b_cfg_c, b_cfg_s, v_cfg_t, v_cfg_c, v_cfg_s,
+                b_t_schedule, v_t_schedule, b_sway_coeff, v_sway_coeff,
+            ],
         )
 
         b_btn.click(
