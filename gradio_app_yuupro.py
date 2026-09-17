@@ -9,6 +9,7 @@ Adapted for local use (no Google Drive)
 import argparse
 import functools
 import os
+import re
 import shutil
 import socket
 import subprocess as sp
@@ -24,6 +25,7 @@ os.chdir(str(REPO_DIR))
 
 import gradio as gr
 from huggingface_hub import try_to_load_from_cache
+from irodori_tts.gradio_emoji_palette import EMOJI_PALETTE_ITEMS
 from irodori_tts.inference_runtime import (
     RuntimeKey, SamplingRequest,
     clear_cached_runtime, default_runtime_device, download_hf_checkpoint,
@@ -57,6 +59,9 @@ MODEL_PRECISION = "fp32"
 # 無視される（InferenceRuntime.synthesize 参照）。UI でもそれらを無効化し、ステップ数の標準値を切り替える。
 RF_DEFAULT_STEPS = 40
 MEANFLOW_DEFAULT_STEPS = 4
+
+# 一度に生成する候補数の上限。候補はバッチで同時生成されるため VRAM 使用量が候補数に比例して増える。
+MAX_CANDIDATES = 8
 
 
 @dataclass(frozen=True)
@@ -143,23 +148,31 @@ if os.path.exists(DICT_FILE):
         SAVED_DICT = f.read()
 
 # --- 絵文字データ ---
-EMOJI_GROUPS = [
-    ("感情", [
-        ("😊", "楽しげ"), ("😆", "喜び"), ("😭", "泣き"), ("😠", "怒り"), ("😲", "驚き"),
-        ("🥺", "震え声"), ("😟", "心配"), ("😖", "苦しい"), ("🫣", "照れ"), ("🙄", "呆れ"),
-        ("😌", "安堵"), ("🤔", "疑問"), ("😱", "悲鳴"),
-    ]),
-    ("話し方", [
-        ("👂", "囁き"), ("😏", "からかい"), ("⏩", "早口"), ("🐢", "ゆっくり"), ("😪", "眠そう"),
-        ("😰", "慌て"), ("🥴", "酔い"), ("🙏", "懇願"), ("🫶", "優しく"), ("🤐", "口塞ぎ"), ("🥵", "うめき声"),
-    ]),
-    ("効果音", [
-        ("😮‍💨", "吐息"), ("🤭", "笑い"), ("🌬️", "息切れ"), ("😮", "息をのむ"),
-        ("👅", "舐め音"), ("💋", "リップ"), ("🥤", "ゴクリ"), ("🤧", "咳"),
-        ("😒", "舌打ち"), ("👌", "相槌"), ("🥱", "あくび"), ("🎵", "鼻歌"),
-        ("⏸️", "間"), ("📢", "エコー"), ("📞", "電話"),
-    ]),
+# 絵文字の定義は irodori_tts/gradio_emoji_palette.py（上流）に従い、ここでは分類だけを持つ。
+# 分類に無い絵文字が上流に追加された場合は「その他」に並ぶ。
+_EMOJI_GROUP_LABELS = [
+    ("感情", "楽しげ 喜び 泣き声 怒り 驚き 震え声 心配 苦しげ 照れ 呆れ 安堵 疑問 悲鳴 得意げ".split()),
+    ("話し方", "囁き からかう 早口 ゆっくり 眠そう 慌てる 酔う 懇願 優しく 口を塞ぐ 喘ぎ 力強く 勢いよく 朗読 寝言".split()),
+    ("効果音", "吐息 笑い 息切れ 息をのむ 舐める音 リップノイズ 飲み込む 咳・鼻 舌打ち 相槌 あくび 鼻歌 間 エコー 電話越し 嗅ぐ音".split()),
 ]
+
+
+def _build_emoji_groups():
+    by_label = {item.label: item for item in EMOJI_PALETTE_ITEMS}
+    used = set()
+    groups = []
+    for name, labels in _EMOJI_GROUP_LABELS:
+        items = [by_label[label] for label in labels if label in by_label and label not in used]
+        used.update(item.label for item in items)
+        if items:
+            groups.append((name, [(item.emoji, item.label) for item in items]))
+    rest = [(item.emoji, item.label) for item in EMOJI_PALETTE_ITEMS if item.label not in used]
+    if rest:
+        groups.append(("その他", rest))
+    return groups
+
+
+EMOJI_GROUPS = _build_emoji_groups()
 
 # --- キャプションプリセット（ベースモデルタブ用） ---
 CAPTION_PRESETS = OrderedDict([
@@ -294,23 +307,67 @@ def _on_model_change(model_choice, prev_meanflow, b_t_schedule, v_t_schedule):
     )
 
 
-def _save(result, prefix, do_save=True):
+def apply_speed(path, rate):
+    """話速を変更したファイルのパスと、変換に成功したか（変換不要なら True）を返す。"""
+    if abs(rate - 1.0) < 0.01 or not _FFMPEG_AVAILABLE:
+        return path, True
+    out = path.replace(".wav", "_speed.wav")
+    proc = sp.run(
+        ["ffmpeg", "-y", "-i", path, "-filter:a", f"atempo={rate}", out],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if proc.returncode != 0 or not os.path.exists(out):
+        print(f"[warning] 話速の変更に失敗しました: {proc.stderr.strip()[-500:]}", flush=True)
+        return path, False
+    return out, True
+
+
+def _save_candidates(result, prefix, do_save, speed):
+    """全候補を保存して話速を適用し、パスのリストを返す。"""
     target_dir = OUTPUT_DIR if do_save else str(REPO_DIR / "temp_outputs")
     Path(target_dir).mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    return str(save_wav(
-        Path(target_dir) / f"{prefix}_{stamp}.wav",
-        result.audio.float(),
-        result.sample_rate,
-    ))
+    multi = len(result.audios) > 1
+    paths = []
+    speed_failed = False
+    for i, audio in enumerate(result.audios, start=1):
+        name = f"{prefix}_{stamp}_{i:02d}.wav" if multi else f"{prefix}_{stamp}.wav"
+        path = str(save_wav(Path(target_dir) / name, audio.float(), result.sample_rate))
+        path, ok = apply_speed(path, speed)
+        speed_failed |= not ok
+        paths.append(path)
+    if speed_failed:
+        gr.Warning("話速の変更に失敗したため、元の速度の音声を出力しました（詳細はコンソール）")
+    return paths
 
 
-def apply_speed(path, rate):
-    if abs(rate - 1.0) < 0.01 or not _FFMPEG_AVAILABLE:
-        return path
-    out = path.replace(".wav", "_speed.wav")
-    sp.run(["ffmpeg", "-y", "-i", path, "-filter:a", f"atempo={rate}", out], capture_output=True)
-    return out if os.path.exists(out) else path
+def _candidate_outputs(paths):
+    """生成音声・候補切替・候補パス State への出力。候補切替は2本以上のときだけ表示する。"""
+    choices = [(f"候補{i + 1}", i) for i in range(len(paths))]
+    return paths[0], gr.update(choices=choices, value=0, visible=len(paths) > 1), paths
+
+
+def _on_candidate_select(index, paths):
+    if index is None or not paths or not 0 <= int(index) < len(paths):
+        return gr.update()
+    return paths[int(index)]
+
+
+def _speed_info(speed):
+    if abs(speed - 1.0) < 0.01:
+        return ""
+    return f" | 話速: {speed:.1f}x" + ("" if _FFMPEG_AVAILABLE else " (ffmpeg未検出のため無効)")
+
+
+def unload_model():
+    global _loaded_repo
+    if _loaded_repo is None:
+        gr.Info("読み込まれているモデルはありません")
+        return
+    print(f"[model] {_loaded_repo} → アンロード中...", flush=True)
+    clear_cached_runtime()
+    _loaded_repo = None
+    gr.Info("モデルをメモリから解放しました。次回の生成時に再読み込みします。")
 
 
 def parse_dict(text):
@@ -327,10 +384,17 @@ def parse_dict(text):
     return d
 
 
-def apply_dict(text, dict_text):
-    for k, v in parse_dict(dict_text).items():
-        text = text.replace(k, v)
-    return text
+def apply_dict(text, dict_text, enabled=True):
+    entries = parse_dict(dict_text) if enabled else {}
+    if not entries:
+        return text
+    # 長い表記を優先して1パスで置換する。置換後の文字列が別のエントリで再置換されることはない。
+    pattern = "|".join(re.escape(k) for k in sorted(entries, key=len, reverse=True))
+    return re.sub(pattern, lambda m: entries[m.group()], text)
+
+
+def preview_dict(text, dict_text, enabled):
+    return gr.update(value=apply_dict((text or "").strip(), dict_text, enabled), visible=True)
 
 
 def save_dict_to_file(dict_text):
@@ -517,11 +581,11 @@ def _meanflow_info(runtime, num_steps):
 # 音声生成関数
 # ==========================================
 
-def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_embed_file, speaker_embed_path_text, num_steps, cfg_t, cfg_c, cfg_s, seed_raw, speed, dict_text, save_audio, max_seconds, specified_seconds, dur_scale, t_schedule_mode, sway_coeff, lora_adapter_raw, progress=gr.Progress()):
+def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_embed_file, speaker_embed_path_text, num_steps, cfg_t, cfg_c, cfg_s, seed_raw, speed, dict_text, dict_enabled, save_audio, num_candidates, max_seconds, specified_seconds, dur_scale, t_schedule_mode, sway_coeff, lora_adapter_raw, progress=gr.Progress()):
     if not text or not text.strip():
         raise gr.Error("テキストを入力してください")
     original = text.strip()
-    processed = apply_dict(original, dict_text)
+    processed = apply_dict(original, dict_text, dict_enabled)
     runtime = _ensure_model(model_choice, progress)
     refs = _resolve_ref_paths(ref_audio, extra_refs)
     cap = caption.strip() if caption and caption.strip() else None
@@ -552,7 +616,7 @@ def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_em
         ref_wav=None, ref_wavs=refs or None,
         ref_latent=None, ref_embed=speaker_embed, no_ref=no_ref,
         ref_normalize_db=-16.0, ref_ensure_max=True,
-        num_candidates=1, decode_mode="sequential",
+        num_candidates=int(num_candidates), decode_mode="sequential",
         seconds=seconds, duration_scale=float(dur_scale),
         # None = チェックポイントの推奨値（v4.1-Small: 120秒）
         max_ref_seconds=None, max_text_len=None, max_caption_len=None,
@@ -570,7 +634,7 @@ def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_em
         trim_tail=True,
         lora_adapter=lora_adapter,
     ), log_fn=lambda m: print(m, flush=True))
-    path = apply_speed(_save(result, "base", save_audio), speed)
+    paths = _save_candidates(result, "base", save_audio, speed)
     if speaker_embed is not None:
         mode = "埋め込みあり"
     elif len(refs) > 1:
@@ -583,23 +647,24 @@ def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_em
         mode += "/説明文あり"
     save_loc = "📁ローカル保存" if save_audio else "🗑️保存なし(一時表示)"
     info = f"🎤 {model_choice}({mode}) | Seed: {result.used_seed} | 生成: {result.total_to_decode:.1f}秒 | {save_loc}"
+    if len(paths) > 1:
+        info += f" | 候補: {len(paths)}本"
     info += _meanflow_info(runtime, num_steps)
     if seconds is not None:
         info += f" | 指定長さ: {seconds:.1f}秒"
     elif abs(float(dur_scale) - 1.0) >= 0.01:
         info += f" | 時間スケール: {float(dur_scale):.2f}x"
-    if abs(speed - 1.0) >= 0.01:
-        info += f" | 話速: {speed:.1f}x" + ("" if _FFMPEG_AVAILABLE else " (ffmpeg未検出のため無効)")
+    info += _speed_info(speed)
     if original != processed:
         info += f"\n📖 辞書適用後: {processed}"
-    return path, info
+    return (*_candidate_outputs(paths), info)
 
 
-def generate_vd(model_choice, text, caption, ref_audio, extra_refs, num_steps, cfg_t, cfg_c, cfg_s, seed_raw, speed, dict_text, save_audio, t_schedule_mode, sway_coeff, progress=gr.Progress()):
+def generate_vd(model_choice, text, caption, ref_audio, extra_refs, num_steps, cfg_t, cfg_c, cfg_s, seed_raw, speed, dict_text, dict_enabled, save_audio, num_candidates, t_schedule_mode, sway_coeff, progress=gr.Progress()):
     if not text or not text.strip():
         raise gr.Error("テキストを入力してください")
     original = text.strip()
-    processed = apply_dict(original, dict_text)
+    processed = apply_dict(original, dict_text, dict_enabled)
     runtime = _ensure_model(model_choice, progress)
     refs = _resolve_ref_paths(ref_audio, extra_refs)
     seed = None
@@ -625,6 +690,7 @@ def generate_vd(model_choice, text, caption, ref_audio, extra_refs, num_steps, c
         t_schedule_mode=t_schedule_mode,
         sway_coeff=float(sway_coeff),
     )
+    kwargs["num_candidates"] = int(num_candidates)
     caption_warning = check_caption_support(runtime.model_cfg.use_caption_condition, kwargs["caption"])
     if caption_warning:
         print(f"[warning] {caption_warning}", flush=True)
@@ -632,7 +698,7 @@ def generate_vd(model_choice, text, caption, ref_audio, extra_refs, num_steps, c
 
     _report_stage(progress, _STAGE_GENERATE, "🎵 音声を生成中…")
     result = runtime.synthesize(SamplingRequest(**kwargs), log_fn=lambda m: print(m, flush=True))
-    path = apply_speed(_save(result, "vd", save_audio), speed)
+    paths = _save_candidates(result, "vd", save_audio, speed)
     used_refs = kwargs["ref_wavs"] or []
     ci = "説明文あり" if kwargs["caption"] else "説明文なし"
     if kwargs["no_ref"]:
@@ -643,12 +709,16 @@ def generate_vd(model_choice, text, caption, ref_audio, extra_refs, num_steps, c
         speaker_mode = "参照あり"
     save_loc = "📁ローカル保存" if save_audio else "🗑️保存なし(一時表示)"
     info = f"🎨 {model_choice}({ci}/{speaker_mode}) | Seed: {result.used_seed} | 生成: {result.total_to_decode:.1f}秒 | {save_loc}"
+    if len(paths) > 1:
+        info += f" | 候補: {len(paths)}本"
     info += _meanflow_info(runtime, num_steps)
-    if abs(speed - 1.0) >= 0.01:
-        info += f" | 話速: {speed:.1f}x" + ("" if _FFMPEG_AVAILABLE else " (ffmpeg未検出のため無効)")
+    info += _speed_info(speed)
     if original != processed:
         info += f"\n📖 辞書適用後: {processed}"
-    return path, info, gr.update(value=caption_warning or "", visible=bool(caption_warning))
+    return (
+        *_candidate_outputs(paths), info,
+        gr.update(value=caption_warning or "", visible=bool(caption_warning)),
+    )
 
 
 # --- 絵文字パレット ---
@@ -732,6 +802,22 @@ CUSTOM_CSS = """
 """
 
 
+CREDITS_MD = """
+- 音声合成エンジン・v4.1-Small / v4.1-Small-MF: [Aratako / Chihiro Arata](https://github.com/Aratako/Irodori-TTS)
+  （[利用条件](https://huggingface.co/Aratako/Irodori-TTS-v4.1-Small#license--ethical-restrictions)）
+- v4.1-Anime: [phasefield-audio](https://huggingface.co/phasefield-audio/Irodori-TTS-v4.1-Anime)
+  （[利用条件](https://huggingface.co/phasefield-audio/Irodori-TTS-v4.1-Anime#license)）
+- UI原作: ゆうぷろ (https://www.youtube.com/@yuupro)
+- コード: MIT License
+
+**禁止事項・注意**
+- 本人の同意なしに声を複製して公開したり、なりすまし等に悪用したりしないでください。
+- 人をだます目的での使用や、誤情報の拡散に使用しないでください。
+- 参照音声を使わない場合でも、偶然実在の人物に似た音声になることがあります。
+- 生成物の利用は利用者の責任で、適用される法令・各モデルの利用条件に従ってください。
+"""
+
+
 def build_ui():
     ffmpeg_status = "🎚️ 話速: 有効" if _FFMPEG_AVAILABLE else "🎚️ 話速: 無効(ffmpeg未検出)"
     speed_label_suffix = "" if _FFMPEG_AVAILABLE else " (ffmpeg未検出のため無効)"
@@ -746,8 +832,9 @@ def build_ui():
         with gr.Row():
             m_model = gr.Dropdown(
                 choices=list(MODEL_PRESETS.keys()), value=DEFAULT_MODEL,
-                label="🧠 使用モデル", scale=1,
+                label="🧠 使用モデル", scale=4,
             )
+            m_unload = gr.Button("🧹 モデルをメモリから解放", size="sm", scale=1)
         m_model_note = gr.Markdown(MODEL_PRESETS[DEFAULT_MODEL].note)
         default_mf = MODEL_PRESETS[DEFAULT_MODEL].meanflow
         # 直前に選ばれていたモデルが MeanFlow か（RF ⇔ MeanFlow を跨いだかの判定用）
@@ -764,6 +851,8 @@ def build_ui():
                             placeholder="音声にしたいテキストを入力...", elem_id="b_text",
                         )
                         create_emoji_palette(b_text, "b_text")
+                        b_dict_preview_btn = gr.Button("📖 辞書を反映した文章を確認", size="sm")
+                        b_dict_preview = gr.Textbox(label="📖 読み上げに使う文章（確認用）", interactive=False, visible=False)
                         with gr.Tabs():
                             with gr.Tab("🎤 参照音声"):
                                 b_ref = gr.Audio(label="参照音声（任意）", type="filepath")
@@ -830,6 +919,10 @@ def build_ui():
                             label=_rf_only_label(BASE_CFG_CAPTION_LABEL, default_mf), interactive=not default_mf,
                         )
                         b_save = gr.Checkbox(label="💾 生成音声をフォルダに自動保存する", value=True)
+                        b_candidates = gr.Slider(
+                            1, MAX_CANDIDATES, 1, step=1,
+                            label="🎲 生成候補数（同時に生成して聞き比べ／増やすほどVRAMと時間を使います）",
+                        )
                         with gr.Accordion("⚙️ パラメータ", open=False):
                             with gr.Row():
                                 b_steps = gr.Slider(
@@ -867,6 +960,8 @@ def build_ui():
                             b_lora_adapter = gr.Textbox(label="LoRA Adapter Directory (optional)", value="")
                     with gr.Column(scale=2, elem_id="b_out_col"):
                         b_btn = gr.Button("🎵 音声を生成", variant="primary", size="lg")
+                        b_cand = gr.Radio([], label="🎲 候補を切り替え", visible=False)
+                        b_paths = gr.State([])
                         b_out = gr.Audio(label="🔈 生成音声", type="filepath")
                         b_info = gr.Textbox(label="ℹ️ 生成情報", interactive=False, lines=3)
 
@@ -886,6 +981,8 @@ def build_ui():
                             placeholder="音声にしたいテキストを入力...", elem_id="v_text",
                         )
                         create_emoji_palette(v_text, "v_text")
+                        v_dict_preview_btn = gr.Button("📖 辞書を反映した文章を確認", size="sm")
+                        v_dict_preview = gr.Textbox(label="📖 読み上げに使う文章（確認用）", interactive=False, visible=False)
 
                         v_ref = gr.Audio(
                             label="🎤 参照音声（任意、空欄=参照なしモード）",
@@ -975,6 +1072,10 @@ def build_ui():
                             label=_rf_only_label(VD_CFG_CAPTION_LABEL, default_mf), interactive=not default_mf,
                         )
                         v_save = gr.Checkbox(label="💾 生成音声をフォルダに自動保存する", value=True)
+                        v_candidates = gr.Slider(
+                            1, MAX_CANDIDATES, 1, step=1,
+                            label="🎲 生成候補数（同時に生成して聞き比べ／増やすほどVRAMと時間を使います）",
+                        )
                         with gr.Accordion("⚙️ パラメータ", open=False):
                             with gr.Row():
                                 v_steps = gr.Slider(
@@ -999,10 +1100,14 @@ def build_ui():
                                 )
                     with gr.Column(scale=2, elem_id="v_out_col"):
                         v_btn = gr.Button("🎵 音声を生成", variant="primary", size="lg")
+                        v_cand = gr.Radio([], label="🎲 候補を切り替え", visible=False)
+                        v_paths = gr.State([])
                         v_out = gr.Audio(label="🔈 生成音声", type="filepath")
                         v_info = gr.Textbox(label="ℹ️ 生成情報", interactive=False, lines=3)
                         gr.Markdown("---")
                         v_preview_btn = gr.Button("🔊 試聴（同じ文章で比較生成）", size="lg")
+                        v_preview_cand = gr.Radio([], label="🎲 候補を切り替え（試聴）", visible=False)
+                        v_preview_paths = gr.State([])
                         v_preview_out = gr.Audio(label="🔊 試聴（比較用、上の結果は上書きされません）", type="filepath")
                         v_preview_info = gr.Textbox(label="ℹ️ 試聴情報", interactive=False, lines=3)
 
@@ -1042,7 +1147,11 @@ def build_ui():
             # ===== 読み辞書 =====
             with gr.Tab("📖 読み辞書"):
                 gr.Markdown("### 📖 読み辞書")
-                gr.Markdown("誤読する単語を登録 → 生成時に自動変換。`変換前=変換後` 形式で1行1エントリ")
+                gr.Markdown(
+                    "誤読する単語を登録 → 生成時に自動変換。`変換前=変換後` 形式で1行1エントリ<br>"
+                    "※長い表記を優先して置換し、置換後の文字が別のエントリで再置換されることはありません。"
+                )
+                dict_enabled = gr.Checkbox(label="📖 読み辞書を使う", value=True)
                 dict_input = gr.Textbox(
                     label="辞書エントリ",
                     placeholder="例:\nIrodori=イロドリ\n彩音=あやね\nTTS=ティーティーエス",
@@ -1071,23 +1180,36 @@ def build_ui():
             ],
         )
 
+        # 生成とモデル解放は同じ concurrency_id で直列化する（生成中に解放されないように）。
         b_btn.click(
             generate_base,
-            [m_model, b_text, b_cap, b_ref, b_extra_refs, b_speaker_embed_file, b_speaker_embed_path, b_steps, b_cfg_t, b_cfg_c, b_cfg_s, b_seed, b_speed, dict_input, b_save, b_max_seconds, b_seconds, b_dur_scale, b_t_schedule, b_sway_coeff, b_lora_adapter],
-            [b_out, b_info],
+            [m_model, b_text, b_cap, b_ref, b_extra_refs, b_speaker_embed_file, b_speaker_embed_path, b_steps, b_cfg_t, b_cfg_c, b_cfg_s, b_seed, b_speed, dict_input, dict_enabled, b_save, b_candidates, b_max_seconds, b_seconds, b_dur_scale, b_t_schedule, b_sway_coeff, b_lora_adapter],
+            [b_out, b_cand, b_paths, b_info],
+            concurrency_id="synthesis",
         )
+        _vd_inputs = [m_model, v_text, v_cap, v_ref, v_extra_refs, v_steps, v_cfg_t, v_cfg_c, v_cfg_s, v_seed, v_speed, dict_input, dict_enabled, v_save, v_candidates, v_t_schedule, v_sway_coeff]
         v_btn.click(
-            generate_vd,
-            [m_model, v_text, v_cap, v_ref, v_extra_refs, v_steps, v_cfg_t, v_cfg_c, v_cfg_s, v_seed, v_speed, dict_input, v_save, v_t_schedule, v_sway_coeff],
-            [v_out, v_info, v_warn],
+            generate_vd, _vd_inputs,
+            [v_out, v_cand, v_paths, v_info, v_warn],
+            concurrency_id="synthesis",
         )
         v_preview_btn.click(
-            generate_vd,
-            [m_model, v_text, v_cap, v_ref, v_extra_refs, v_steps, v_cfg_t, v_cfg_c, v_cfg_s, v_seed, v_speed, dict_input, v_save, v_t_schedule, v_sway_coeff],
-            [v_preview_out, v_preview_info, v_warn],
+            generate_vd, _vd_inputs,
+            [v_preview_out, v_preview_cand, v_preview_paths, v_preview_info, v_warn],
+            concurrency_id="synthesis",
         )
+        m_unload.click(unload_model, concurrency_id="synthesis")
 
-        gr.Markdown("---\n📜 コード・モデル: MIT License | [Irodori-TTS](https://github.com/Aratako/Irodori-TTS)")
+        for _cand, _paths, _out in [
+            (b_cand, b_paths, b_out), (v_cand, v_paths, v_out), (v_preview_cand, v_preview_paths, v_preview_out),
+        ]:
+            _cand.input(_on_candidate_select, [_cand, _paths], [_out], queue=False)
+
+        b_dict_preview_btn.click(preview_dict, [b_text, dict_input, dict_enabled], [b_dict_preview], queue=False)
+        v_dict_preview_btn.click(preview_dict, [v_text, dict_input, dict_enabled], [v_dict_preview], queue=False)
+
+        with gr.Accordion("📜 クレジット・利用条件", open=False):
+            gr.Markdown(CREDITS_MD)
 
     return app
 
