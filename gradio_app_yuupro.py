@@ -8,12 +8,14 @@ Adapted for local use (no Google Drive)
 
 import argparse
 import functools
+import gc
 import os
 import re
 import shutil
 import socket
 import subprocess as sp
 import sys
+import traceback
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
@@ -24,7 +26,9 @@ sys.path.insert(0, str(REPO_DIR))
 os.chdir(str(REPO_DIR))
 
 import gradio as gr
+import torch
 from huggingface_hub import try_to_load_from_cache
+from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
 from irodori_tts.gradio_emoji_palette import EMOJI_PALETTE_ITEMS
 from irodori_tts.inference_runtime import (
     RuntimeKey, SamplingRequest,
@@ -118,6 +122,7 @@ VD_CFG_CAPTION_LABEL = "音声スタイルの効き具合 標準=4"
 CFG_SPEAKER_LABEL = "CFG Speaker"
 T_SCHEDULE_LABEL = "Time Schedule"
 SWAY_COEFF_LABEL = "Sway Coeff"
+SPEAKER_KV_LABEL = "🧲 話者の似せ具合の強調（speaker_kv_scale）1.0=無効"
 
 
 def _default_steps(meanflow):
@@ -304,6 +309,7 @@ def _on_model_change(model_choice, prev_meanflow, b_t_schedule, v_t_schedule):
         rf_only(CFG_TEXT_LABEL), rf_only(VD_CFG_CAPTION_LABEL), rf_only(CFG_SPEAKER_LABEL),
         rf_only(T_SCHEDULE_LABEL), rf_only(T_SCHEDULE_LABEL),
         sway(b_t_schedule), sway(v_t_schedule),
+        rf_only(SPEAKER_KV_LABEL),
     )
 
 
@@ -581,7 +587,48 @@ def _meanflow_info(runtime, num_steps):
 # 音声生成関数
 # ==========================================
 
-def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_embed_file, speaker_embed_path_text, num_steps, cfg_t, cfg_c, cfg_s, seed_raw, speed, dict_text, dict_enabled, save_audio, num_candidates, max_seconds, specified_seconds, dur_scale, t_schedule_mode, sway_coeff, lora_adapter_raw, progress=gr.Progress()):
+def _is_network_error(exc):
+    if isinstance(exc, (HfHubHTTPError, LocalEntryNotFoundError, ConnectionError, TimeoutError)):
+        return True
+    message = str(exc).lower()
+    return any(word in message for word in ("connection", "timed out", "timeout", "offline"))
+
+
+def _friendly_error_message(exc):
+    if isinstance(exc, torch.OutOfMemoryError) or "out of memory" in str(exc).lower():
+        return (
+            "GPUメモリが不足しました。生成候補数・最大生成時間・参照音声の長さを減らすか、"
+            "GPUを使う他のアプリを閉じてから再度お試しください。"
+        )
+    if _is_network_error(exc):
+        return "モデルのダウンロードまたは通信でエラーが発生しました。インターネット接続を確認して再度お試しください。"
+    if isinstance(exc, FileNotFoundError):
+        return f"ファイルが見つかりません: {exc.filename or exc}"
+    if isinstance(exc, ValueError):
+        return f"入力値に問題があります: {exc}"
+    return f"生成中にエラーが発生しました（{type(exc).__name__}: {exc}）。詳細はコンソールを確認してください。"
+
+
+def _friendly_errors(fn):
+    """生成関数の例外を日本語の案内に変換して gr.Error で表示する。詳細はコンソールに出す。"""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except gr.Error:
+            raise
+        except Exception as exc:
+            traceback.print_exc()
+            if isinstance(exc, torch.OutOfMemoryError) and torch.cuda.is_available():
+                # 失敗した生成の中間テンソルを解放し、続けて小さい設定で再試行できるようにする
+                gc.collect()
+                torch.cuda.empty_cache()
+            raise gr.Error(_friendly_error_message(exc), duration=None) from exc
+    return wrapper
+
+
+@_friendly_errors
+def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_embed_file, speaker_embed_path_text, num_steps, cfg_t, cfg_c, cfg_s, seed_raw, speed, dict_text, dict_enabled, save_audio, num_candidates, max_seconds, specified_seconds, dur_scale, t_schedule_mode, sway_coeff, speaker_kv_scale, lora_adapter_raw, progress=gr.Progress()):
     if not text or not text.strip():
         raise gr.Error("テキストを入力してください")
     original = text.strip()
@@ -610,6 +657,8 @@ def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_em
     if seconds is not None and seconds > effective_max_seconds:
         effective_max_seconds = seconds
     lora_adapter = _parse_optional_str(lora_adapter_raw)
+    # 1.0 はスケーリングなしと等価なので無効（None）として扱う
+    kv_scale = float(speaker_kv_scale) if abs(float(speaker_kv_scale) - 1.0) >= 0.01 else None
     _report_stage(progress, _STAGE_GENERATE, "🎵 音声を生成中…")
     result = runtime.synthesize(SamplingRequest(
         text=processed, caption=cap,
@@ -628,7 +677,7 @@ def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_em
         cfg_scale=None, cfg_min_t=0.5, cfg_max_t=1.0,
         truncation_factor=None, rescale_k=None, rescale_sigma=None,
         context_kv_cache=True,
-        speaker_kv_scale=None, speaker_kv_min_t=None, speaker_kv_max_layers=None,
+        speaker_kv_scale=None if no_ref else kv_scale, speaker_kv_min_t=None, speaker_kv_max_layers=None,
         t_schedule_mode=str(t_schedule_mode),
         sway_coeff=float(sway_coeff),
         trim_tail=True,
@@ -650,6 +699,8 @@ def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_em
     if len(paths) > 1:
         info += f" | 候補: {len(paths)}本"
     info += _meanflow_info(runtime, num_steps)
+    if kv_scale is not None and not no_ref and runtime.model_cfg.flow_parameterization != "meanflow":
+        info += f" | 似せ具合の強調: {kv_scale:.1f}x"
     if seconds is not None:
         info += f" | 指定長さ: {seconds:.1f}秒"
     elif abs(float(dur_scale) - 1.0) >= 0.01:
@@ -660,6 +711,7 @@ def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_em
     return (*_candidate_outputs(paths), info)
 
 
+@_friendly_errors
 def generate_vd(model_choice, text, caption, ref_audio, extra_refs, num_steps, cfg_t, cfg_c, cfg_s, seed_raw, speed, dict_text, dict_enabled, save_audio, num_candidates, t_schedule_mode, sway_coeff, progress=gr.Progress()):
     if not text or not text.strip():
         raise gr.Error("テキストを入力してください")
@@ -957,6 +1009,11 @@ def build_ui():
                                     minimum=-1.0, maximum=1.5, value=-1.0, step=0.1,
                                     interactive=False,
                                 )
+                            b_speaker_kv = gr.Slider(
+                                1.0, 3.0, 1.0, step=0.1,
+                                label=_rf_only_label(SPEAKER_KV_LABEL, default_mf), interactive=not default_mf,
+                                info="参照音声／埋め込みの声に似にくいときに少しずつ上げてください（実験的・上げすぎると不自然になります）",
+                            )
                             b_lora_adapter = gr.Textbox(label="LoRA Adapter Directory (optional)", value="")
                     with gr.Column(scale=2, elem_id="b_out_col"):
                         b_btn = gr.Button("🎵 音声を生成", variant="primary", size="lg")
@@ -1177,13 +1234,14 @@ def build_ui():
                 m_model_note, m_is_meanflow, b_steps, v_steps,
                 b_cfg_t, b_cfg_c, b_cfg_s, v_cfg_t, v_cfg_c, v_cfg_s,
                 b_t_schedule, v_t_schedule, b_sway_coeff, v_sway_coeff,
+                b_speaker_kv,
             ],
         )
 
         # 生成とモデル解放は同じ concurrency_id で直列化する（生成中に解放されないように）。
         b_btn.click(
             generate_base,
-            [m_model, b_text, b_cap, b_ref, b_extra_refs, b_speaker_embed_file, b_speaker_embed_path, b_steps, b_cfg_t, b_cfg_c, b_cfg_s, b_seed, b_speed, dict_input, dict_enabled, b_save, b_candidates, b_max_seconds, b_seconds, b_dur_scale, b_t_schedule, b_sway_coeff, b_lora_adapter],
+            [m_model, b_text, b_cap, b_ref, b_extra_refs, b_speaker_embed_file, b_speaker_embed_path, b_steps, b_cfg_t, b_cfg_c, b_cfg_s, b_seed, b_speed, dict_input, dict_enabled, b_save, b_candidates, b_max_seconds, b_seconds, b_dur_scale, b_t_schedule, b_sway_coeff, b_speaker_kv, b_lora_adapter],
             [b_out, b_cand, b_paths, b_info],
             concurrency_id="synthesis",
         )
