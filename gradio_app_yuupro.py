@@ -459,8 +459,23 @@ def _tone_preset_choices(query, category_label_value, favorites_only):
     return [(_preset_label(p), p.id) for p in results]
 
 
-def _on_tone_filter_change(query, category_label_value, favorites_only):
-    return gr.update(choices=_tone_preset_choices(query, category_label_value, favorites_only))
+def _on_tone_filter_change(query, category_label_value, favorites_only, current_id):
+    choices = _tone_preset_choices(query, category_label_value, favorites_only)
+    # 選択中のプリセットが絞り込み結果から外れても choices に残す。
+    # 外すと Dropdown の値が choices 外になり、生成時に Gradio が入力を拒否する。
+    # 値を切り替えると .change が走って caption を上書きしてしまうため、値は維持する。
+    current = get_tone_preset(current_id) if current_id else None
+    if current is not None and all(pid != current.id for _label, pid in choices):
+        choices.insert(0, (_preset_label(current), current.id))
+    return gr.update(choices=choices)
+
+
+def _on_tone_recent_selected(recent_id, query, category_label_value, favorites_only):
+    if not recent_id or get_tone_preset(recent_id) is None:
+        return gr.update()
+    update = _on_tone_filter_change(query, category_label_value, favorites_only, recent_id)
+    update["value"] = recent_id
+    return update
 
 
 def _describe_tone_preset(preset_id):
@@ -1174,7 +1189,7 @@ def build_ui():
                 for _filter_comp in (v_tone_search, v_tone_category, v_tone_fav_only):
                     _filter_comp.change(
                         _on_tone_filter_change,
-                        inputs=[v_tone_search, v_tone_category, v_tone_fav_only],
+                        inputs=[v_tone_search, v_tone_category, v_tone_fav_only, v_tone_preset],
                         outputs=[v_tone_preset],
                     )
                 v_tone_preset.change(
@@ -1182,7 +1197,11 @@ def build_ui():
                     inputs=[v_tone_preset],
                     outputs=[v_cap, v_tone_current, v_tone_recent],
                 )
-                v_tone_recent.change(lambda pid: pid, inputs=[v_tone_recent], outputs=[v_tone_preset])
+                v_tone_recent.change(
+                    _on_tone_recent_selected,
+                    inputs=[v_tone_recent, v_tone_search, v_tone_category, v_tone_fav_only],
+                    outputs=[v_tone_preset],
+                )
                 v_tone_fav_btn.click(_on_tone_favorite_toggle, inputs=[v_tone_preset])
 
                 _custom_inputs = [
