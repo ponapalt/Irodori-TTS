@@ -33,7 +33,7 @@ from irodori_tts.gradio_emoji_palette import EMOJI_PALETTE_ITEMS
 from irodori_tts.inference_runtime import (
     RuntimeKey, SamplingRequest,
     clear_cached_runtime, default_runtime_device, download_hf_checkpoint,
-    get_cached_runtime, save_wav,
+    get_cached_runtime, list_available_runtime_precisions, save_wav,
 )
 from irodori_tts.tone_custom import EMOTION_CHOICES, build_custom_caption
 from irodori_tts.tone_library import ToneLibraryStore, search_presets
@@ -54,9 +54,9 @@ for _d in [OUTPUT_DIR, REF_DIR]:
 CODEC_REPO = "Aratako/Semantic-DACVAE-Japanese-32dim"
 
 # --- モデル定義 ---
-# いずれも v4.1 系の統合チェックポイント（クローンとボイスデザインが1モデルに統合）なので、
-# タブを切り替えてもモデルの載せ替えは発生しない。精度・codec も共通のため、
-# プリセットが持つ差分は repo id・説明文・MeanFlow モデルかどうかだけでよい。
+# いずれも v4 系の統合チェックポイント（クローンとボイスデザインが1モデルに統合）なので、
+# タブを切り替えてもモデルの載せ替えは発生しない。codec も共通のため、
+# プリセットが持つ差分は repo id・説明文・精度・MeanFlow モデルかどうかだけでよい。
 MODEL_PRECISION = "fp32"
 
 # MeanFlow モデルは蒸留時に CFG を焼き込んでおり、ランタイム側の CFG / Time Schedule / Sway は
@@ -73,6 +73,8 @@ class ModelPreset:
     repo: str  # Hugging Face repo id
     note: str  # UI に表示する説明文（Markdown）
     meanflow: bool = False  # MeanFlow 蒸留モデルか（UI のパラメータ切替にのみ使う）
+    # 希望するロード精度。bf16 は CUDA/XPU でしか使えないため、それ以外では fp32 に落とす（_resolve_precision）。
+    precision: str = MODEL_PRECISION
 
 
 MODEL_PRESETS = OrderedDict([
@@ -102,6 +104,18 @@ MODEL_PRESETS = OrderedDict([
             "<br>※効き具合（CFG）スライダー・Time Schedule・Sway Coeff は蒸留時に固定されているため無効になります。"
         ),
         meanflow=True,
+    )),
+    ("v4-Large（高品質 / 大型）", ModelPreset(
+        repo="Aratako/Irodori-TTS-v4-Large",
+        note=(
+            "**v4-Large（3.3Bパラメータ / bf16・ダウンロード約13.2GB）** — Small の約4倍の大型モデル。"
+            "テキスト・説明文エンコーダが T5Gemma 2 になり、説明文（caption）への追従性が向上しています。"
+            "参照音声・説明文・絵文字の使い方は v4.1-Small と同じです。"
+            "<br>※読み込み後は約6.6GBですが、読み込み中は一時的に fp32 分（約13GB）の VRAM を使います。"
+            "CUDA 以外の環境では fp32 のまま読み込まれます。"
+            "<br>※Gemma 利用規約の対象モデルです（下部のクレジット参照）。"
+        ),
+        precision="bf16",
     )),
 ])
 
@@ -208,11 +222,18 @@ _ALL_CATEGORIES_LABEL = "すべて"
 # ユーティリティ関数
 # ==========================================
 
-def _make_key(ckpt):
+def _resolve_precision(preset):
+    """プリセットの希望精度が現在のデバイスで使えなければ fp32 にする。"""
+    if preset.precision in list_available_runtime_precisions(default_runtime_device()):
+        return preset.precision
+    return MODEL_PRECISION
+
+
+def _make_key(ckpt, precision):
     d = default_runtime_device()
     return RuntimeKey(
         checkpoint=ckpt, model_device=d, codec_repo=CODEC_REPO,
-        model_precision=MODEL_PRECISION, codec_device=d, codec_precision="fp32",
+        model_precision=precision, codec_device=d, codec_precision="fp32",
         compile_model=False, compile_dynamic=False,
     )
 
@@ -243,7 +264,7 @@ def _ensure_model(model_choice, progress):
     v4.1 系では hf_hub_download ではなくこちらを使う必要がある。
 
     get_cached_runtime は新しいランタイムを構築してから古い方をアンロードするため、
-    そのままだと切替の瞬間に約3.1GBのモデルが二重に載る。先に clear_cached_runtime() で
+    そのままだと切替の瞬間にモデル（Small で約3.1GB、Large で約13GB）が二重に載る。先に clear_cached_runtime() で
     解放してから読み込む。
 
     初回のダウンロード（codec はランタイム構築時に取得される）や読み込みは数十秒〜十数分
@@ -272,10 +293,11 @@ def _ensure_model(model_choice, progress):
         if not codec_cached:
             desc += "（初回は音声コーデックのダウンロードを含む）"
         _report_stage(progress, _STAGE_LOAD, desc)
-    runtime, reloaded = get_cached_runtime(_make_key(ckpt))
+    precision = _resolve_precision(preset)
+    runtime, reloaded = get_cached_runtime(_make_key(ckpt, precision))
     _loaded_repo = preset.repo
     if reloaded:
-        print(f"[model] {preset.repo} ({MODEL_PRECISION}) ロード完了", flush=True)
+        print(f"[model] {preset.repo} ({precision}) ロード完了", flush=True)
     return runtime
 
 
@@ -874,6 +896,10 @@ CREDITS_MD = """
   （[利用条件](https://huggingface.co/Aratako/Irodori-TTS-v4.1-Small#license--ethical-restrictions)）
 - v4.1-Anime: [phasefield-audio](https://huggingface.co/phasefield-audio/Irodori-TTS-v4.1-Anime)
   （[利用条件](https://huggingface.co/phasefield-audio/Irodori-TTS-v4.1-Anime#license)）
+- v4-Large: [Aratako / Chihiro Arata](https://huggingface.co/Aratako/Irodori-TTS-v4-Large)
+  （[利用条件](https://huggingface.co/Aratako/Irodori-TTS-v4-Large#license--ethical-restrictions)・
+  [Gemma Terms of Use](https://ai.google.dev/gemma/terms)・
+  [Gemma Prohibited Use Policy](https://ai.google.dev/gemma/prohibited_use_policy)）
 - UI原作: ゆうぷろ (https://www.youtube.com/@yuupro)
 - コード: MIT License
 
