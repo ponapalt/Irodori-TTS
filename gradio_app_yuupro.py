@@ -489,6 +489,47 @@ def load_ref_preset(name):
     return str(p) if p.exists() else None
 
 
+def _on_ref_quick_select(name):
+    # 右カラムの選択専用ドロップダウン。「（選択なし）」を選んでも参照音声は消さない。
+    path = load_ref_preset(name)
+    return path if path else gr.update()
+
+
+def _refresh_ref_dropdowns(*current_values):
+    # 保存・削除後に、全タブの参照音声プリセットのドロップダウンの選択肢を最新化する。
+    choices = list_ref_presets()
+    return tuple(
+        gr.update(choices=choices, value=v if v in choices else "（選択なし）")
+        for v in current_values
+    )
+
+
+def _build_ref_preset_accordion(ref_audio):
+    """参照音声プリセットの管理 UI（使用・保存・削除）を組み立てる。
+
+    戻り値は (保存済みプリセットのドロップダウン, (保存イベント, 削除イベント))。
+    各イベントの後に全タブのドロップダウンを最新化する処理は呼び出し側でつなぐ。
+    """
+    with gr.Accordion("📋 参照音声プリセット", open=False):
+        with gr.Row():
+            ref_dd = gr.Dropdown(
+                choices=list_ref_presets(), value="（選択なし）",
+                label="保存済みプリセット", scale=3,
+            )
+            ref_load = gr.Button("📂 使用", size="sm", scale=1)
+        with gr.Row():
+            ref_name = gr.Textbox(
+                label="新規プリセット名", placeholder="名前を入力...", scale=3,
+            )
+            ref_save = gr.Button("💾 保存", size="sm", scale=1)
+            ref_del = gr.Button("🗑️ 削除", size="sm", scale=1)
+        ref_msg = gr.Textbox(label="ステータス", interactive=False)
+        ref_load.click(load_ref_preset, [ref_dd], [ref_audio])
+        save_evt = ref_save.click(save_ref_preset, [ref_audio, ref_name], [ref_dd, ref_msg])
+        del_evt = ref_del.click(delete_ref_preset, [ref_dd], [ref_dd, ref_msg])
+    return ref_dd, (save_evt, del_evt)
+
+
 # --- 声のトーン・感情プリセット ブラウザ ---
 
 def _preset_label(preset):
@@ -977,23 +1018,7 @@ def build_ui():
                         with gr.Tabs():
                             with gr.Tab("🎤 参照音声"):
                                 b_ref = gr.Audio(label="参照音声（任意）", type="filepath")
-                                with gr.Accordion("📋 参照音声プリセット", open=False):
-                                    with gr.Row():
-                                        b_ref_dd = gr.Dropdown(
-                                            choices=list_ref_presets(), value="（選択なし）",
-                                            label="保存済みプリセット", scale=3,
-                                        )
-                                        b_ref_load = gr.Button("📂 使用", size="sm", scale=1)
-                                    with gr.Row():
-                                        b_ref_name = gr.Textbox(
-                                            label="新規プリセット名", placeholder="名前を入力...", scale=3,
-                                        )
-                                        b_ref_save = gr.Button("💾 保存", size="sm", scale=1)
-                                        b_ref_del = gr.Button("🗑️ 削除", size="sm", scale=1)
-                                    b_ref_msg = gr.Textbox(label="ステータス", interactive=False)
-                                    b_ref_load.click(load_ref_preset, [b_ref_dd], [b_ref])
-                                    b_ref_save.click(save_ref_preset, [b_ref, b_ref_name], [b_ref_dd, b_ref_msg])
-                                    b_ref_del.click(delete_ref_preset, [b_ref_dd], [b_ref_dd, b_ref_msg])
+                                b_ref_dd, b_ref_evts = _build_ref_preset_accordion(b_ref)
                                 b_extra_refs = gr.File(
                                     label="➕ 追加の参照音声（任意・複数可／上の参照音声の後ろに並べた順で連結）",
                                     type="filepath", file_count="multiple",
@@ -1086,6 +1111,10 @@ def build_ui():
                             b_lora_adapter = gr.Textbox(label="LoRA Adapter Directory (optional)", value="")
                     with gr.Column(scale=2, elem_id="b_out_col"):
                         b_btn = gr.Button("🎵 音声を生成", variant="primary", size="lg")
+                        b_ref_quick = gr.Dropdown(
+                            choices=list_ref_presets(), value="（選択なし）",
+                            label="📋 参照音声プリセット（選択すると参照音声に読み込み）",
+                        )
                         b_cand = gr.Radio([], label="🎲 候補を切り替え", visible=False)
                         b_paths = gr.State([])
                         b_out = gr.Audio(label="🔈 生成音声", type="filepath")
@@ -1114,6 +1143,7 @@ def build_ui():
                             label="🎤 参照音声（任意、空欄=参照なしモード）",
                             type="filepath",
                         )
+                        v_ref_dd, v_ref_evts = _build_ref_preset_accordion(v_ref)
                         v_extra_refs = gr.File(
                             label="➕ 追加の参照音声（任意・複数可／上の参照音声の後ろに並べた順で連結）",
                             type="filepath", file_count="multiple",
@@ -1226,6 +1256,10 @@ def build_ui():
                                 )
                     with gr.Column(scale=2, elem_id="v_out_col"):
                         v_btn = gr.Button("🎵 音声を生成", variant="primary", size="lg")
+                        v_ref_quick = gr.Dropdown(
+                            choices=list_ref_presets(), value="（選択なし）",
+                            label="📋 参照音声プリセット（選択すると参照音声に読み込み）",
+                        )
                         v_cand = gr.Radio([], label="🎲 候補を切り替え", visible=False)
                         v_paths = gr.State([])
                         v_out = gr.Audio(label="🔈 生成音声", type="filepath")
@@ -1335,6 +1369,13 @@ def build_ui():
             (b_cand, b_paths, b_out), (v_cand, v_paths, v_out), (v_preview_cand, v_preview_paths, v_preview_out),
         ]:
             _cand.input(_on_candidate_select, [_cand, _paths], [_out], queue=False)
+
+        # .input はユーザー操作時のみ発火するので、選択肢の再読み込みで参照音声が上書きされない
+        b_ref_quick.input(_on_ref_quick_select, [b_ref_quick], [b_ref], queue=False)
+        v_ref_quick.input(_on_ref_quick_select, [v_ref_quick], [v_ref], queue=False)
+        _ref_dropdowns = [b_ref_dd, b_ref_quick, v_ref_dd, v_ref_quick]
+        for _evt in (*b_ref_evts, *v_ref_evts):
+            _evt.then(_refresh_ref_dropdowns, _ref_dropdowns, _ref_dropdowns, queue=False)
 
         b_dict_preview_btn.click(preview_dict, [b_text, dict_input, dict_enabled], [b_dict_preview], queue=False)
         v_dict_preview_btn.click(preview_dict, [v_text, dict_input, dict_enabled], [v_dict_preview], queue=False)
