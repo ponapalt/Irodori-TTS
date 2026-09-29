@@ -70,11 +70,13 @@ MAX_CANDIDATES = 8
 
 @dataclass(frozen=True)
 class ModelPreset:
-    repo: str  # Hugging Face repo id
+    repo: str  # Hugging Face repo id（"owner/repo/subfolder" 形式でサブフォルダも指定可）
     note: str  # UI に表示する説明文（Markdown）
     meanflow: bool = False  # MeanFlow 蒸留モデルか（UI のパラメータ切替にのみ使う）
     # 希望するロード精度。bf16 は CUDA/XPU でしか使えないため、それ以外では fp32 に落とす（_resolve_precision）。
     precision: str = MODEL_PRECISION
+    # torchao 量子化モデルなど NVIDIA CUDA でしか動作確認されていないモデル。CUDA 以外ではロードを断る。
+    cuda_only: bool = False
 
 
 MODEL_PRESETS = OrderedDict([
@@ -111,11 +113,24 @@ MODEL_PRESETS = OrderedDict([
             "**v4-Large（3.3Bパラメータ / bf16・ダウンロード約13.2GB）** — Small の約4倍の大型モデル。"
             "テキスト・説明文エンコーダが T5Gemma 2 になり、説明文（caption）への追従性が向上しています。"
             "参照音声・説明文・絵文字の使い方は v4.1-Small と同じです。"
-            "<br>※読み込み後は約6.6GBですが、読み込み中は一時的に fp32 分（約13GB）の VRAM を使います。"
-            "CUDA 以外の環境では fp32 のまま読み込まれます。"
+            "<br>※VRAM 約6.6GB。読み込み時は fp32 の重みを少しずつ bf16 に変換するため、"
+            "メインメモリも約7GB使います。CUDA 以外の環境では fp32 のまま読み込まれます（約13GB）。"
             "<br>※Gemma 利用規約の対象モデルです（下部のクレジット参照）。"
         ),
         precision="bf16",
+    )),
+    ("v4-Large-INT8（大型 / 省メモリ）", ModelPreset(
+        repo="Aratako/Irodori-TTS-v4-Large-Quantized/int8-weight-only",
+        note=(
+            "**v4-Large-INT8（INT8 重み量子化 / ダウンロード約3.8GB）** — v4-Large の重みを INT8 に量子化した版。"
+            "計算は bf16 で行うため（W8A16）、音質の劣化を抑えつつ VRAM を約4GBまで減らせます"
+            "（読み込み中はメインメモリを一時的に約10GB使います）。"
+            "使い方は v4-Large と同じです。"
+            "<br>※NVIDIA GPU（CUDA）専用です。"
+            "<br>※Gemma 利用規約の対象モデルです（下部のクレジット参照）。"
+        ),
+        precision="bf16",
+        cuda_only=True,
     )),
 ])
 
@@ -250,7 +265,14 @@ def _report_stage(progress, stage, desc):
 
 
 def _is_hf_file_cached(repo_id, filename):
-    """HF キャッシュにファイルがあるか（通信なし）。待機理由の表示の出し分けにだけ使う。"""
+    """HF キャッシュにファイルがあるか（通信なし）。待機理由の表示の出し分けにだけ使う。
+
+    repo_id は "owner/repo/subfolder" 形式も受け付け、サブフォルダ内の filename を調べる。
+    """
+    parts = repo_id.split("/")
+    if len(parts) > 2:
+        repo_id = "/".join(parts[:2])
+        filename = "/".join(parts[2:] + [filename])
     try:
         return isinstance(try_to_load_from_cache(repo_id=repo_id, filename=filename), str)
     except Exception:
@@ -264,7 +286,7 @@ def _ensure_model(model_choice, progress):
     v4.1 系では hf_hub_download ではなくこちらを使う必要がある。
 
     get_cached_runtime は新しいランタイムを構築してから古い方をアンロードするため、
-    そのままだと切替の瞬間にモデル（Small で約3.1GB、Large で約13GB）が二重に載る。先に clear_cached_runtime() で
+    そのままだと切替の瞬間にモデル（Small で約3.1GB、Large で約6.6GB）が二重に載る。先に clear_cached_runtime() で
     解放してから読み込む。
 
     初回のダウンロード（codec はランタイム構築時に取得される）や読み込みは数十秒〜十数分
@@ -272,6 +294,11 @@ def _ensure_model(model_choice, progress):
     """
     global _loaded_repo
     preset = get_preset(model_choice)
+    if preset.cuda_only and default_runtime_device() != "cuda":
+        raise gr.Error(
+            f"「{model_choice}」は NVIDIA GPU（CUDA）専用です。別のモデルを選択してください。",
+            duration=None,
+        )
     codec_cached = _is_hf_file_cached(CODEC_REPO, "weights.pth")
 
     if not _is_hf_file_cached(preset.repo, "model.safetensors"):
@@ -898,6 +925,7 @@ CREDITS_MD = """
   （[利用条件](https://huggingface.co/phasefield-audio/Irodori-TTS-v4.1-Anime#license)）
 - v4-Large: [Aratako / Chihiro Arata](https://huggingface.co/Aratako/Irodori-TTS-v4-Large)
   （[利用条件](https://huggingface.co/Aratako/Irodori-TTS-v4-Large#license--ethical-restrictions)・
+  INT8 版: [Irodori-TTS-v4-Large-Quantized](https://huggingface.co/Aratako/Irodori-TTS-v4-Large-Quantized)・
   [Gemma Terms of Use](https://ai.google.dev/gemma/terms)・
   [Gemma Prohibited Use Policy](https://ai.google.dev/gemma/prohibited_use_policy)）
 - UI原作: ゆうぷろ (https://www.youtube.com/@yuupro)
