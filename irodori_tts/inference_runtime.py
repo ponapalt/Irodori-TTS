@@ -654,6 +654,12 @@ class InferenceRuntime:
             model_state,
             assign=model_cfg.use_pretrained_text_encoder or quantized_model,
         )
+        # Release the loaded state dict so the CPU cast below does not hold both copies.
+        del model_state
+        if not quantized_model:
+            # Cast on CPU before moving so reduced-precision runs never materialize
+            # full fp32 weights on the accelerator. No-op when the dtype already matches.
+            model = _move_inference_module(model, device=torch.device("cpu"), dtype=model_dtype)
         model = model.to(model_device)
         model = _move_inference_module(model, device=model_device, dtype=model_dtype)
         model.eval()
