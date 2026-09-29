@@ -1111,8 +1111,8 @@ def build_ui():
                         b_cand = gr.Radio([], label="🎲 候補を切り替え", visible=False)
                         b_paths = gr.State([])
                         b_out = gr.Audio(label="🔈 生成音声", type="filepath")
-                        b_info = gr.Textbox(label="ℹ️ 生成情報", interactive=False, lines=3)
                         b_ref_dd, b_ref_evts = _build_ref_preset_accordion(b_ref)
+                        b_info = gr.Textbox(label="ℹ️ 生成情報", interactive=False, lines=3)
 
             # ===== ボイスデザイン =====
             with gr.Tab("🎨 ボイスデザイン"):
@@ -1252,7 +1252,6 @@ def build_ui():
                         v_cand = gr.Radio([], label="🎲 候補を切り替え", visible=False)
                         v_paths = gr.State([])
                         v_out = gr.Audio(label="🔈 生成音声", type="filepath")
-                        v_info = gr.Textbox(label="ℹ️ 生成情報", interactive=False, lines=3)
                         with gr.Accordion("🔊 試聴（同じ文章で比較生成）", open=False):
                             v_preview_btn = gr.Button("🔊 試聴（同じ文章で比較生成）", size="lg")
                             v_preview_cand = gr.Radio([], label="🎲 候補を切り替え（試聴）", visible=False)
@@ -1260,6 +1259,7 @@ def build_ui():
                             v_preview_out = gr.Audio(label="🔊 試聴（比較用、上の結果は上書きされません）", type="filepath")
                             v_preview_info = gr.Textbox(label="ℹ️ 試聴情報", interactive=False, lines=3)
                         v_ref_dd, v_ref_evts = _build_ref_preset_accordion(v_ref)
+                        v_info = gr.Textbox(label="ℹ️ 生成情報", interactive=False, lines=3)
 
                 v_tone_mode.change(
                     _on_tone_mode_change, inputs=[v_tone_mode], outputs=[v_tone_preset_panel, v_tone_custom_panel],
