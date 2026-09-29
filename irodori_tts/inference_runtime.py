@@ -7,8 +7,9 @@ import math
 import secrets
 import threading
 import time
-from collections.abc import Callable
-from contextlib import nullcontext
+import weakref
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -498,14 +499,22 @@ def _load_checkpoint_from_safetensors(
     if not isinstance(model_state, dict) or not model_state:
         raise ValueError(f"Safetensors checkpoint has no model weights: {path}")
 
-    with safe_open(str(path), framework="pt", device="cpu") as handle:
-        metadata = handle.metadata() or {}
-
+    metadata, model_cfg, inference_cfg, text_encoder_config = _read_safetensors_checkpoint_header(
+        path
+    )
     if parse_quantization_metadata(metadata) is not None:
         model_state, _ = unflatten_quantized_state_dict(
             model_state,
             metadata=metadata,
         )
+    return model_state, model_cfg, inference_cfg, text_encoder_config
+
+
+def _read_safetensors_checkpoint_header(
+    path: Path,
+) -> tuple[dict[str, str], dict, dict | None, dict | None]:
+    with safe_open(str(path), framework="pt", device="cpu") as handle:
+        metadata = handle.metadata() or {}
 
     flat_config = _parse_json_mapping(
         metadata.get(_CONFIG_META_KEY),
@@ -519,7 +528,7 @@ def _load_checkpoint_from_safetensors(
         path=path,
     )
     model_cfg, inference_cfg = _split_flat_checkpoint_config(path=path, flat_config=flat_config)
-    return model_state, model_cfg, inference_cfg, text_encoder_config
+    return metadata, model_cfg, inference_cfg, text_encoder_config
 
 
 def _load_checkpoint_for_inference(
@@ -528,6 +537,94 @@ def _load_checkpoint_for_inference(
     if path.suffix.lower() == ".safetensors":
         return _load_checkpoint_from_safetensors(path)
     return _load_checkpoint_from_pt(path)
+
+
+# Tensors are handed to load_state_dict in chunks of roughly this size, so host memory
+# peaks near the reduced-precision model instead of also holding a full fp32 state dict.
+_STREAMING_LOAD_CHUNK_BYTES = 512 * 1024 * 1024
+
+
+def _load_safetensors_state_streaming(
+    model: torch.nn.Module,
+    path: Path,
+    *,
+    dtype: torch.dtype,
+    assign: bool,
+) -> None:
+    """Strictly load a non-quantized safetensors checkpoint, casting floats to ``dtype`` per tensor."""
+    expected_keys = set(model.state_dict().keys())
+    seen_keys: set[str] = set()
+    unexpected_keys: list[str] = []
+    chunk: dict[str, torch.Tensor] = {}
+    chunk_bytes = 0
+
+    def flush() -> None:
+        nonlocal chunk, chunk_bytes
+        if not chunk:
+            return
+        result = model.load_state_dict(chunk, strict=False, assign=assign)
+        unexpected_keys.extend(result.unexpected_keys)
+        chunk = {}
+        chunk_bytes = 0
+
+    with safe_open(str(path), framework="pt", device="cpu") as handle:
+        for key in handle.keys():
+            tensor = handle.get_tensor(key)
+            if tensor.is_floating_point() and tensor.dtype != dtype:
+                tensor = tensor.to(dtype=dtype)
+            chunk[key] = tensor
+            seen_keys.add(key)
+            chunk_bytes += tensor.numel() * tensor.element_size()
+            if chunk_bytes >= _STREAMING_LOAD_CHUNK_BYTES:
+                flush()
+        flush()
+
+    if not seen_keys:
+        raise ValueError(f"Safetensors checkpoint has no model weights: {path}")
+    missing_keys = sorted(expected_keys - seen_keys)
+    if missing_keys or unexpected_keys:
+        raise RuntimeError(
+            f"Error(s) in loading state_dict for {type(model).__name__}: "
+            f"missing_keys={missing_keys[:8]} unexpected_keys={sorted(unexpected_keys)[:8]}"
+        )
+
+
+@contextmanager
+def _register_parameters_in_dtype(dtype: torch.dtype) -> Iterator[None]:
+    """Cast floating-point parameters to ``dtype`` as modules register them.
+
+    Building a large model directly in reduced precision avoids materializing a full fp32
+    copy on the host first. Buffers are left untouched and keep their existing cast path.
+    """
+    if dtype == torch.float32:
+        yield
+        return
+    # Keyed by id() with a weak reference, so a parameter registered twice (weight tying)
+    # maps to the same converted parameter without keeping the fp32 original alive.
+    converted: dict[int, tuple[weakref.ref, torch.nn.Parameter]] = {}
+
+    def hook(
+        _module: torch.nn.Module,
+        _name: str,
+        param: torch.nn.Parameter | None,
+    ) -> torch.nn.Parameter | None:
+        if param is None or not param.is_floating_point() or param.dtype == dtype:
+            return None
+        entry = converted.get(id(param))
+        if entry is not None and entry[0]() is param:
+            return entry[1]
+        new_param = torch.nn.Parameter(
+            param.detach().to(dtype=dtype),
+            requires_grad=param.requires_grad,
+        )
+        converted[id(param)] = (weakref.ref(param), new_param)
+        return new_param
+
+    handle = torch.nn.modules.module.register_module_parameter_registration_hook(hook)
+    try:
+        yield
+    finally:
+        handle.remove()
 
 
 def _split_hf_checkpoint_source(source: str) -> tuple[str, str | None]:
@@ -635,25 +732,46 @@ class InferenceRuntime:
         )
 
         checkpoint_path = Path(key.checkpoint)
-        model_state, model_cfg_dict, train_cfg, text_encoder_config = (
-            _load_checkpoint_for_inference(checkpoint_path)
-        )
+        # Reduced-precision loads of plain safetensors checkpoints stream the weights and cast
+        # them per tensor, so a large fp32 checkpoint never sits in host memory in full.
+        stream_weights = False
+        if checkpoint_path.suffix.lower() == ".safetensors" and model_dtype != torch.float32:
+            metadata, model_cfg_dict, train_cfg, text_encoder_config = (
+                _read_safetensors_checkpoint_header(checkpoint_path)
+            )
+            stream_weights = parse_quantization_metadata(metadata) is None
+        if stream_weights:
+            model_state = None
+        else:
+            model_state, model_cfg_dict, train_cfg, text_encoder_config = (
+                _load_checkpoint_for_inference(checkpoint_path)
+            )
         model_cfg = merge_dataclass_overrides(
             ModelConfig(),
             model_cfg_dict,
             section="checkpoint model_config",
         )
 
-        model = TextToLatentRFDiT(
-            model_cfg,
-            pretrained_backbone_config=text_encoder_config,
-            load_pretrained_backbone_weights=not model_cfg.use_pretrained_text_encoder,
-        )
-        quantized_model = is_torchao_quantized_state_dict(model_state)
-        model.load_state_dict(
-            model_state,
-            assign=model_cfg.use_pretrained_text_encoder or quantized_model,
-        )
+        with _register_parameters_in_dtype(model_dtype):
+            model = TextToLatentRFDiT(
+                model_cfg,
+                pretrained_backbone_config=text_encoder_config,
+                load_pretrained_backbone_weights=not model_cfg.use_pretrained_text_encoder,
+            )
+        if model_state is None:
+            quantized_model = False
+            _load_safetensors_state_streaming(
+                model,
+                checkpoint_path,
+                dtype=model_dtype,
+                assign=model_cfg.use_pretrained_text_encoder,
+            )
+        else:
+            quantized_model = is_torchao_quantized_state_dict(model_state)
+            model.load_state_dict(
+                model_state,
+                assign=model_cfg.use_pretrained_text_encoder or quantized_model,
+            )
         # Release the loaded state dict so the CPU cast below does not hold both copies.
         del model_state
         if not quantized_model:
