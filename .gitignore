@@ -225,3 +225,7 @@ data/
 dictionary.txt
 ref_audio_presets/
 tone_library.json
+
+# ゆうぷろカスタムのオプション設定・前回入力（ローカル）
+yuupro_settings.json
+yuupro_previous_input.json
