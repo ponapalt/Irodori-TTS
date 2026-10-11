@@ -40,15 +40,17 @@ from irodori_tts.tone_library import ToneLibraryStore, search_presets
 from irodori_tts.tone_presets import CATEGORIES, category_label
 from irodori_tts.tone_presets import get_preset as get_tone_preset
 from irodori_tts.tone_request import build_vd_request_kwargs, check_caption_support
+from irodori_tts import yuupro_options as opts
 
 # --- ローカル設定 ---
-OUTPUT_DIR = str(REPO_DIR / "gradio_outputs")
+# OUTPUT_DIR は既定の保存先。保存先やファイル名は「オプション設定」タブで変更できる（yuupro_options）。
+OUTPUT_DIR = str(opts.DEFAULT_EXPORT_DIR)
 REF_DIR = str(REPO_DIR / "ref_audio_presets")
 DICT_FILE = str(REPO_DIR / "dictionary.txt")
 TONE_LIBRARY_FILE = str(REPO_DIR / "tone_library.json")
 TONE_LIBRARY = ToneLibraryStore(TONE_LIBRARY_FILE)
 
-for _d in [OUTPUT_DIR, REF_DIR]:
+for _d in [OUTPUT_DIR, REF_DIR, str(opts.TEMP_DIR)]:
     Path(_d).mkdir(parents=True, exist_ok=True)
 
 CODEC_REPO = "Aratako/Semantic-DACVAE-Japanese-32dim"
@@ -175,11 +177,6 @@ if not _FFMPEG_AVAILABLE:
     print("[warning] ffmpeg が見つかりません。話速コントロールは無効になります。")
     print("          https://ffmpeg.org/download.html からインストールしてPATHに追加してください。")
 
-# --- 保存済み辞書の読込 ---
-SAVED_DICT = ""
-if os.path.exists(DICT_FILE):
-    with open(DICT_FILE, encoding="utf-8") as f:
-        SAVED_DICT = f.read()
 
 # --- 絵文字データ ---
 # 絵文字の定義は irodori_tts/gradio_emoji_palette.py（上流）に従い、ここでは分類だけを持つ。
@@ -377,35 +374,50 @@ def apply_speed(path, rate):
     return out, True
 
 
-def _save_candidates(result, prefix, do_save, speed):
-    """全候補を保存して話速を適用し、パスのリストを返す。"""
-    target_dir = OUTPUT_DIR if do_save else str(REPO_DIR / "temp_outputs")
-    Path(target_dir).mkdir(parents=True, exist_ok=True)
+def _save_candidates(result, prefix, do_save, speed, text):
+    """全候補を内部領域（temp_outputs）に作って話速を適用し、(表示用パスのリスト, 保存結果の文言リスト) を返す。
+
+    do_save が真なら「オプション設定」の保存先・ファイル名で書き出す（yuupro_options.publish_candidates）。
+    表示用パスは保存名と同じ名前の内部コピーで、ダウンロード時の名前にもなる。
+    """
+    opts.TEMP_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     multi = len(result.audios) > 1
     paths = []
     speed_failed = False
     for i, audio in enumerate(result.audios, start=1):
         name = f"{prefix}_{stamp}_{i:02d}.wav" if multi else f"{prefix}_{stamp}.wav"
-        path = str(save_wav(Path(target_dir) / name, audio.float(), result.sample_rate))
-        path, ok = apply_speed(path, speed)
+        raw = str(save_wav(opts.TEMP_DIR / name, audio.float(), result.sample_rate))
+        path, ok = apply_speed(raw, speed)
+        if path != raw:
+            Path(raw).unlink(missing_ok=True)
         speed_failed |= not ok
         paths.append(path)
     if speed_failed:
         gr.Warning("話速の変更に失敗したため、元の速度の音声を出力しました（詳細はコンソール）")
-    return paths
+    return opts.publish_candidates(paths, text, prefix, do_save)
+
+
+def _save_note(do_save, notes):
+    """生成情報の末尾に付ける保存先の案内。"""
+    if not do_save:
+        return ""
+    return "".join(f"\n📁 {note}" for note in notes)
 
 
 def _candidate_outputs(paths):
-    """生成音声・候補切替・候補パス State への出力。候補切替は2本以上のときだけ表示する。"""
+    """生成音声・候補切替・候補パス State・ダウンロードボタンへの出力。候補切替は2本以上のときだけ表示する。"""
     choices = [(f"候補{i + 1}", i) for i in range(len(paths))]
-    return paths[0], gr.update(choices=choices, value=0, visible=len(paths) > 1), paths
+    return (
+        paths[0], gr.update(choices=choices, value=0, visible=len(paths) > 1), paths,
+        gr.update(value=paths[0], visible=True),
+    )
 
 
 def _on_candidate_select(index, paths):
     if index is None or not paths or not 0 <= int(index) < len(paths):
-        return gr.update()
-    return paths[int(index)]
+        return gr.update(), gr.update()
+    return paths[int(index)], gr.update(value=paths[int(index)], visible=True)
 
 
 def _speed_info(speed):
@@ -456,6 +468,88 @@ def save_dict_to_file(dict_text):
     with open(DICT_FILE, "w", encoding="utf-8") as f:
         f.write(dict_text or "")
     return f"✅ 辞書を保存しました: {DICT_FILE}"
+
+
+def load_dict_file():
+    """保存済みの辞書テキスト。ページを開くたびに読み直す（GUI での編集は即ファイルへ保存されるため）。"""
+    try:
+        with open(DICT_FILE, encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+# --- 読み辞書の GUI 編集 ---
+# 辞書の実体は従来どおり「変換前=変換後」の1行1エントリのテキスト（dictionary.txt）。
+# GUI の操作は該当行だけを書き換え、コメント行など辞書として解釈されない行は残す。
+
+def dict_view(dict_text):
+    """一覧表と、編集・削除する登録の選択肢。"""
+    entries = parse_dict(dict_text)
+    return [[k, v] for k, v in entries.items()], gr.update(choices=list(entries), value=None)
+
+
+def _dict_line_key(line):
+    key, sep, _ = line.partition("=")
+    return key.strip() if sep else None
+
+
+def dict_upsert(dict_text, word, reading):
+    word, reading = (word or "").strip(), (reading or "").strip()
+    if not word or not reading:
+        raise ValueError("「表記」と「読み方」の両方を入力してください。")
+    if len(word) > 100 or len(reading) > 200 or "\n" in word or "\n" in reading:
+        raise ValueError("1行で入力してください。表記は100文字、読み方は200文字までです。")
+    if "=" in word:
+        raise ValueError("表記に「=」は使えません。")
+    lines, out, replaced = (dict_text or "").split("\n"), [], False
+    for line in lines:
+        if _dict_line_key(line) == word:
+            if not replaced:
+                out.append(f"{word}={reading}")
+                replaced = True
+            continue
+        out.append(line)
+    if not replaced:
+        while out and not out[-1].strip():
+            out.pop()
+        out.append(f"{word}={reading}")
+    message = "読み方を更新しました。" if replaced else "読み方を登録しました。"
+    return "\n".join(out), message
+
+
+def dict_remove(dict_text, word):
+    if not word:
+        raise ValueError("削除する登録を一覧から選んでください。")
+    out = [line for line in (dict_text or "").split("\n") if _dict_line_key(line) != word]
+    return "\n".join(out), "選んだ登録を削除しました。"
+
+
+def _dict_rejected(exc):
+    # gr.Error だと複数の出力欄がすべて「エラー」表示になるため、ステータス欄に出すだけにする
+    return (gr.skip(), gr.skip(), gr.skip(), f"⚠️ {exc}", gr.skip(), gr.skip())
+
+
+def dict_save_entry(dict_text, word, reading):
+    try:
+        new_text, message = dict_upsert(dict_text, word, reading)
+    except ValueError as exc:
+        return _dict_rejected(exc)
+    save_dict_to_file(new_text)
+    return (new_text, *dict_view(new_text), f"✅ {message}", "", "")
+
+
+def dict_delete_entry(dict_text, word):
+    try:
+        new_text, message = dict_remove(dict_text, word)
+    except ValueError as exc:
+        return _dict_rejected(exc)
+    save_dict_to_file(new_text)
+    return (new_text, *dict_view(new_text), f"✅ {message}", "", "")
+
+
+def dict_choose(dict_text, word):
+    return word or "", parse_dict(dict_text).get(word, "")
 
 
 # --- 参照音声プリセット ---
@@ -782,7 +876,7 @@ def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_em
         trim_tail=True,
         lora_adapter=lora_adapter,
     ), log_fn=lambda m: print(m, flush=True))
-    paths = _save_candidates(result, "base", save_audio, speed)
+    paths, save_notes = _save_candidates(result, "base", save_audio, speed, original)
     if speaker_embed is not None:
         mode = "埋め込みあり"
     elif len(refs) > 1:
@@ -807,6 +901,7 @@ def generate_base(model_choice, text, caption, ref_audio, extra_refs, speaker_em
     info += _speed_info(speed)
     if original != processed:
         info += f"\n📖 辞書適用後: {processed}"
+    info += _save_note(save_audio, save_notes)
     return (*_candidate_outputs(paths), info)
 
 
@@ -849,7 +944,7 @@ def generate_vd(model_choice, text, caption, ref_audio, extra_refs, num_steps, c
 
     _report_stage(progress, _STAGE_GENERATE, "🎵 音声を生成中…")
     result = runtime.synthesize(SamplingRequest(**kwargs), log_fn=lambda m: print(m, flush=True))
-    paths = _save_candidates(result, "vd", save_audio, speed)
+    paths, save_notes = _save_candidates(result, "vd", save_audio, speed, original)
     used_refs = kwargs["ref_wavs"] or []
     ci = "説明文あり" if kwargs["caption"] else "説明文なし"
     if kwargs["no_ref"]:
@@ -866,6 +961,7 @@ def generate_vd(model_choice, text, caption, ref_audio, extra_refs, num_steps, c
     info += _speed_info(speed)
     if original != processed:
         info += f"\n📖 辞書適用後: {processed}"
+    info += _save_note(save_audio, save_notes)
     return (
         *_candidate_outputs(paths), info,
         gr.update(value=caption_warning or "", visible=bool(caption_warning)),
@@ -995,6 +1091,7 @@ def build_ui():
                 label="🧠 使用モデル", scale=4,
             )
             m_unload = gr.Button("🧹 モデルをメモリから解放", size="sm", scale=1)
+            gr.HTML(opts.VOLUME_HTML, min_width=220)
         m_model_note = gr.Markdown(MODEL_PRESETS[DEFAULT_MODEL].note)
         default_mf = MODEL_PRESETS[DEFAULT_MODEL].meanflow
         # 直前に選ばれていたモデルが MeanFlow か（RF ⇔ MeanFlow を跨いだかの判定用）
@@ -1110,7 +1207,8 @@ def build_ui():
                         b_btn = gr.Button("🎵 音声を生成", variant="primary", size="lg")
                         b_cand = gr.Radio([], label="🎲 候補を切り替え", visible=False)
                         b_paths = gr.State([])
-                        b_out = gr.Audio(label="🔈 生成音声", type="filepath")
+                        b_out = gr.Audio(label="🔈 生成音声", type="filepath", elem_classes="yuupro-player")
+                        b_dl = gr.DownloadButton(label="💾 WAVをダウンロード", visible=False)
                         b_ref_dd, b_ref_evts = _build_ref_preset_accordion(b_ref)
                         b_info = gr.Textbox(label="ℹ️ 生成情報", interactive=False, lines=3)
 
@@ -1251,12 +1349,17 @@ def build_ui():
                         v_btn = gr.Button("🎵 音声を生成", variant="primary", size="lg")
                         v_cand = gr.Radio([], label="🎲 候補を切り替え", visible=False)
                         v_paths = gr.State([])
-                        v_out = gr.Audio(label="🔈 生成音声", type="filepath")
+                        v_out = gr.Audio(label="🔈 生成音声", type="filepath", elem_classes="yuupro-player")
+                        v_dl = gr.DownloadButton(label="💾 WAVをダウンロード", visible=False)
                         with gr.Accordion("🔊 試聴（同じ文章で比較生成）", open=False):
                             v_preview_btn = gr.Button("🔊 試聴（同じ文章で比較生成）", size="lg")
                             v_preview_cand = gr.Radio([], label="🎲 候補を切り替え（試聴）", visible=False)
                             v_preview_paths = gr.State([])
-                            v_preview_out = gr.Audio(label="🔊 試聴（比較用、上の結果は上書きされません）", type="filepath")
+                            v_preview_out = gr.Audio(
+                                label="🔊 試聴（比較用、上の結果は上書きされません）", type="filepath",
+                                elem_classes="yuupro-player",
+                            )
+                            v_preview_dl = gr.DownloadButton(label="💾 WAVをダウンロード", visible=False)
                             v_preview_info = gr.Textbox(label="ℹ️ 試聴情報", interactive=False, lines=3)
                         v_ref_dd, v_ref_evts = _build_ref_preset_accordion(v_ref)
                         v_info = gr.Textbox(label="ℹ️ 生成情報", interactive=False, lines=3)
@@ -1302,20 +1405,51 @@ def build_ui():
             with gr.Tab("📖 読み辞書"):
                 gr.Markdown("### 📖 読み辞書")
                 gr.Markdown(
-                    "誤読する単語を登録 → 生成時に自動変換。`変換前=変換後` 形式で1行1エントリ<br>"
+                    "誤読する単語を登録 → 生成時に自動変換。下の欄に入力して「登録・更新」を押すと、そのまま辞書ファイルへ保存されます。<br>"
                     "※長い表記を優先して置換し、置換後の文字が別のエントリで再置換されることはありません。"
+                    "短い表記は別の単語にも一致するため、各タブの「辞書を反映した文章を確認」で確かめてください。"
                 )
                 dict_enabled = gr.Checkbox(label="📖 読み辞書を使う", value=True)
-                dict_input = gr.Textbox(
-                    label="辞書エントリ",
-                    placeholder="例:\nIrodori=イロドリ\n彩音=あやね\nTTS=ティーティーエス",
-                    lines=12, value=SAVED_DICT,
+                dict_word = gr.Textbox(label="表記", placeholder="例：Irodori", info="文章の中で置き換えたい文字です。大文字・小文字も区別します。")
+                dict_reading = gr.Textbox(label="読み方", placeholder="例：いろどり", info="ひらがな・カタカナで読み方を書きます。")
+                gr.Examples(
+                    [["Irodori", "いろどり"], ["TTS", "てぃーてぃーえす"], ["日本橋", "にほんばし"]],
+                    inputs=[dict_word, dict_reading], label="入力例（クリックで入力・登録ボタンで保存）",
                 )
-                dict_save_btn = gr.Button("💾 辞書を保存（ローカルファイルに保存）", size="sm")
+                dict_add_btn = gr.Button("登録・更新", variant="primary")
                 dict_status = gr.Textbox(label="ステータス", interactive=False)
-                dict_save_btn.click(save_dict_to_file, [dict_input], [dict_status])
+                dict_table = gr.Dataframe(
+                    headers=["表記", "読み方"], datatype=["str", "str"], type="array",
+                    interactive=False, label="登録済みの読み方",
+                )
+                dict_select = gr.Dropdown(
+                    choices=[], label="編集・削除する登録",
+                    info="選ぶと上の入力欄に表示します。同じ表記で登録すると読み方を更新します。表記を変えると別の登録になります。",
+                )
+                dict_remove_btn = gr.Button("🗑️ 選んだ登録を削除")
+                with gr.Accordion("📝 テキストで直接編集（上級者向け）", open=False):
+                    # 値はページを開くたびにファイルから読み直す（GUI での編集が即ファイルに反映されるため）
+                    dict_input = gr.Textbox(
+                        label="辞書エントリ（変換前=変換後・1行1エントリ）",
+                        placeholder="例:\nIrodori=イロドリ\n彩音=あやね\nTTS=ティーティーエス",
+                        lines=12, value=load_dict_file,
+                    )
+                    dict_save_btn = gr.Button("💾 辞書を保存（ローカルファイルに保存）", size="sm")
                 gr.Markdown("💡 辞書はすべてのタブの音声生成に自動で適用されます")
                 gr.Markdown(f"📁 保存先: `{DICT_FILE}`")
+
+                _dict_outputs = [dict_input, dict_table, dict_select, dict_status, dict_word, dict_reading]
+                dict_add_btn.click(dict_save_entry, [dict_input, dict_word, dict_reading], _dict_outputs, api_name=False)
+                dict_remove_btn.click(dict_delete_entry, [dict_input, dict_select], _dict_outputs, api_name=False)
+                dict_select.input(dict_choose, [dict_input, dict_select], [dict_word, dict_reading], api_name=False)
+                dict_save_btn.click(save_dict_to_file, [dict_input], [dict_status], api_name=False).then(
+                    lambda text: dict_view(text), [dict_input], [dict_table, dict_select], queue=False, api_name=False,
+                )
+                app.load(lambda: dict_view(load_dict_file()), outputs=[dict_table, dict_select], queue=False, show_progress="hidden")
+
+            # ===== オプション設定 =====
+            with gr.Tab("⚙️ オプション設定"):
+                option_controls = opts.build_options_tab()
 
         b_t_schedule.change(
             _on_t_schedule_mode_change, inputs=[b_t_schedule], outputs=[b_sway_coeff]
@@ -1339,26 +1473,65 @@ def build_ui():
         b_btn.click(
             generate_base,
             [m_model, b_text, b_cap, b_ref, b_extra_refs, b_speaker_embed_file, b_speaker_embed_path, b_steps, b_cfg_t, b_cfg_c, b_cfg_s, b_seed, b_speed, dict_input, dict_enabled, b_save, b_candidates, b_max_seconds, b_seconds, b_dur_scale, b_t_schedule, b_sway_coeff, b_speaker_kv, b_lora_adapter],
-            [b_out, b_cand, b_paths, b_info],
+            [b_out, b_cand, b_paths, b_dl, b_info],
             concurrency_id="synthesis",
         )
         _vd_inputs = [m_model, v_text, v_cap, v_ref, v_extra_refs, v_steps, v_cfg_t, v_cfg_c, v_cfg_s, v_seed, v_speed, dict_input, dict_enabled, v_save, v_candidates, v_t_schedule, v_sway_coeff]
         v_btn.click(
             generate_vd, _vd_inputs,
-            [v_out, v_cand, v_paths, v_info, v_warn],
+            [v_out, v_cand, v_paths, v_dl, v_info, v_warn],
             concurrency_id="synthesis",
         )
         v_preview_btn.click(
             generate_vd, _vd_inputs,
-            [v_preview_out, v_preview_cand, v_preview_paths, v_preview_info, v_warn],
+            [v_preview_out, v_preview_cand, v_preview_paths, v_preview_dl, v_preview_info, v_warn],
             concurrency_id="synthesis",
         )
         m_unload.click(unload_model, concurrency_id="synthesis")
 
-        for _cand, _paths, _out in [
-            (b_cand, b_paths, b_out), (v_cand, v_paths, v_out), (v_preview_cand, v_preview_paths, v_preview_out),
+        for _cand, _paths, _out, _dl in [
+            (b_cand, b_paths, b_out, b_dl), (v_cand, v_paths, v_out, v_dl),
+            (v_preview_cand, v_preview_paths, v_preview_out, v_preview_dl),
         ]:
-            _cand.input(_on_candidate_select, [_cand, _paths], [_out], queue=False)
+            _cand.input(_on_candidate_select, [_cand, _paths], [_out, _dl], queue=False)
+
+        # --- 配色テーマ・再生音量（ページを開くたびに適用） ---
+        app.load(fn=None, inputs=option_controls["theme"], outputs=None, js=opts.THEME_JS)
+        app.load(fn=None, js=opts.VOLUME_JS)
+
+        # --- 前回の入力の復元（オプション設定でONのとき） ---
+        # 参照音声・スピーカー埋め込み・LoRA・説明文プリセット/トーン設定の選択状態は対象外。
+        # トーン設定は変更で caption を上書きするため、最終的に送信される caption（v_cap）だけを戻す。
+        _persist = {
+            "m_model": m_model, "dict_enabled": dict_enabled,
+            "b_text": b_text, "b_cap": b_cap, "b_speed": b_speed, "b_cfg_t": b_cfg_t, "b_cfg_c": b_cfg_c,
+            "b_save": b_save, "b_candidates": b_candidates, "b_steps": b_steps, "b_cfg_s": b_cfg_s,
+            "b_max_seconds": b_max_seconds, "b_seconds": b_seconds, "b_dur_scale": b_dur_scale,
+            "b_seed": b_seed, "b_t_schedule": b_t_schedule, "b_sway_coeff": b_sway_coeff,
+            "b_speaker_kv": b_speaker_kv,
+            "v_text": v_text, "v_cap": v_cap, "v_speed": v_speed, "v_cfg_t": v_cfg_t, "v_cfg_c": v_cfg_c,
+            "v_save": v_save, "v_candidates": v_candidates, "v_steps": v_steps, "v_cfg_s": v_cfg_s,
+            "v_seed": v_seed, "v_t_schedule": v_t_schedule, "v_sway_coeff": v_sway_coeff,
+        }
+        opts.attach_input_memory(_persist)
+        _persist_keys = list(_persist)
+        _persist_allowed = {
+            "m_model": set(MODEL_PRESETS),
+            "b_t_schedule": {"linear", "sway"}, "v_t_schedule": {"linear", "sway"},
+        }
+
+        def _restore_inputs():
+            updates = opts.restore_updates(_persist_keys, _persist_allowed)
+            # _on_model_change が「RF⇔MeanFlow を跨いだ」と誤判定して steps を標準値へ戻さないよう、
+            # 直前モデルの MeanFlow 状態も復元後のモデルに合わせておく。
+            model = opts.previous_input().get("m_model")
+            mf_state = get_preset(model).meanflow if model in MODEL_PRESETS else gr.skip()
+            return [*updates, mf_state]
+
+        app.load(
+            _restore_inputs, outputs=[*_persist.values(), m_is_meanflow],
+            queue=False, show_progress="hidden", api_name=False,
+        )
 
         # .input はユーザー操作時のみ発火するので、選択肢の再読み込みで参照音声が上書きされない
         _ref_dropdowns = [b_ref_dd, v_ref_dd]
@@ -1391,7 +1564,7 @@ def main():
     print("=" * 60)
     print("🎙️ Irodori-TTS ゆうぷろカスタム V2.0.0 [ローカル版]")
     print(f"   🧠 既定モデル : {DEFAULT_MODEL}")
-    print(f"   📁 出力先     : {OUTPUT_DIR}")
+    print(f"   📁 出力先     : {OUTPUT_DIR}（オプション設定で変更可）")
     print(f"   🎤 参照音声   : {REF_DIR}")
     print(f"   📖 辞書       : {DICT_FILE}")
     print(f"   🎚️ ffmpeg     : {'利用可能' if _FFMPEG_AVAILABLE else '未検出（話速無効）'}")
@@ -1409,6 +1582,7 @@ def main():
     print("=" * 60)
     print()
 
+    opts.install_connection_reset_filter()
     app = build_ui()
     app.queue(default_concurrency_limit=1)
     app.launch(
@@ -1416,6 +1590,7 @@ def main():
         server_port=args.server_port,
         share=args.share,
         debug=args.debug,
+        inbrowser=opts.read_settings()["auto_browser"],
         theme=gr.themes.Soft(),
     )
 
